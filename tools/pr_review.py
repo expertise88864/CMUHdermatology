@@ -454,6 +454,40 @@ def main() -> int:
                         help="re-post a verdict whose GitHub recording failed (no new review)")
     args = parser.parse_args()
     try:
+        lock = None if args.pending else acquire_lock()
+    except (Blocked, OSError) as exc:
+        print(f"[pr-review] BLOCKED: {exc}", file=sys.stderr)
+        return 1
+    try:
+        return run(args)
+    finally:
+        if lock is not None:
+            release_lock(lock)
+
+
+def acquire_lock() -> Path:
+    """One review per checkout at a time (2026-11-18): the wrapper's prompt, raw log,
+    last message, identity proof and this driver's binding are shared files, and a
+    concurrent run could verify or post another run's verdict. mkdir is atomic."""
+    state = ROOT / ".codex-review"
+    state.mkdir(exist_ok=True)
+    lock = state / "pr_review.lock"
+    try:
+        lock.mkdir()
+    except FileExistsError:
+        raise Blocked(f"Another review is running in this checkout ({lock} exists); "
+                      "remove it only if no review is running") from None
+    (lock / "owner").write_text(f"pid={os.getpid()}\n", encoding="utf-8")
+    return lock
+
+
+def release_lock(lock: Path) -> None:
+    (lock / "owner").unlink(missing_ok=True)
+    lock.rmdir()
+
+
+def run(args: argparse.Namespace) -> int:
+    try:
         api = API(repository())
         if args.pending:
             return list_pending(api)
@@ -461,6 +495,8 @@ def main() -> int:
         if git("status", "--porcelain", "--untracked-files=all"):
             raise Blocked("Working tree must be clean: the review covers committed history only")
         subprocess.run(["git", "fetch", "--no-tags", "-q", "origin", "main"], cwd=ROOT, check=True)
+        # Pin main now: fetching a missing PR head below rewrites FETCH_HEAD.
+        main_sha = git("rev-parse", "FETCH_HEAD")
         if args.pr:
             pr = find_pr(api, "", args.pr)
             head = historical_head(pr, head)
@@ -473,7 +509,7 @@ def main() -> int:
             if not remote or remote[0] != head:
                 raise Blocked("Push this exact head to origin first; the PR must show what was reviewed")
             pr = find_pr(api, branch, None)
-        base = git("merge-base", git("rev-parse", "FETCH_HEAD"), head)
+        base = git("merge-base", main_sha, head)
         if base == head and args.pr:
             # Backfill of a head already published to main: reuse the base the PR's
             # recorded review covered, else the PR's own base.

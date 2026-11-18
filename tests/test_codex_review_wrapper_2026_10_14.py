@@ -70,7 +70,7 @@ sys.exit(int(os.environ["FIXTURE_RC"]))
 class CodexReviewWrapperTests(unittest.TestCase):
     def run_wrapper(self, *, resume=False, recorded=None, count=0, returned=SID,
                     model="gpt-6.2-astra", effort="medium", sandbox="read-only", rc=0,
-                    prior=None, truncate=False, cli="codex", prompt_ok=True):
+                    prior=None, truncate=False, cli="codex", prompt_ok=True, locked=False):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory) / "repo"
             root.mkdir()
@@ -85,6 +85,8 @@ class CodexReviewWrapperTests(unittest.TestCase):
             state = root / ".codex-review"
             state.mkdir()
             (state / "last_pass").write_text(str(count))
+            if locked:   # another review holds this checkout
+                (state / "wrapper.lock").mkdir()
             if recorded:
                 (state / "last_session_id").write_text(recorded)
                 if prompt_ok:   # its first round proved the full prompt arrived
@@ -158,6 +160,14 @@ class CodexReviewWrapperTests(unittest.TestCase):
                 self.assertEqual(rc, 4, out)
                 self.assertEqual(passes, "1" if resume else "0", out)
                 self.assertIn("truncated or different prompt", out)
+
+    def test_concurrent_review_in_the_same_checkout_is_refused(self):
+        for resume in (False, True):
+            with self.subTest(resume=resume):
+                rc, called, sid, passes, out = self.run_wrapper(resume=resume, recorded=SID,
+                                                                count=1, locked=True)
+                self.assertEqual(rc, 64, out)
+                self.assertIsNone(called)
 
     def test_batch_shim_cli_is_refused_before_running(self):
         for cli in ("C:/npm/codex.cmd", "C:/npm/CODEX.CMD", "C:/x/codex.bat", "C:/npm/codex.ps1"):
@@ -255,7 +265,6 @@ class NativeCliSelectionTests(unittest.TestCase):
         with patch.object(identity.os, "name", "nt"), \
              patch.dict(identity.os.environ, {"LOCALAPPDATA": ""}), \
              patch.object(identity, "path_files", side_effect=lambda n: [hits[n]] if n in hits else []), \
-             patch.object(identity.shutil, "which", side_effect=lambda n: hits.get(n)), \
              patch.object(identity, "cli_version", return_value="codex-cli 0.169.1"):
             return identity.find_codex()
 
@@ -299,6 +308,24 @@ class NativeCliSelectionTests(unittest.TestCase):
             npm = self._layout(Path(tmp), native=False)
             with self.assertRaises(ValueError):
                 self._select(identity, npm, "codex.cmd")
+
+    @unittest.skipIf(os.name == "nt", "POSIX executable-bit lookup")
+    def test_posix_newer_install_later_on_path_is_not_shadowed(self):
+        from unittest.mock import patch
+        identity = self._identity()
+        with tempfile.TemporaryDirectory() as tmp:
+            dirs = []
+            for name in ("old", "new"):
+                d = Path(tmp) / name
+                d.mkdir()
+                (d / "codex").write_text("#!/bin/sh\n", encoding="utf-8")
+                (d / "codex").chmod(0o755)
+                dirs.append(str(d))
+            with patch.dict(identity.os.environ, {"PATH": os.pathsep.join(dirs)}), \
+                 patch.object(identity, "cli_version",
+                              side_effect=lambda p: "codex-cli 0.169.1" if "new" in p else "codex-cli 0.150.0"):
+                path, _ = identity.find_codex()
+            self.assertIn("new", path)
 
     def test_newer_install_later_on_path_is_not_shadowed(self):
         # An older project-local .bin ahead of a newer global prefix must not hide it.

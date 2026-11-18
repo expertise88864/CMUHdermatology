@@ -10,7 +10,6 @@ import math
 import os
 from pathlib import Path
 import re
-import shutil
 import subprocess
 import sys
 
@@ -99,12 +98,11 @@ def codex_candidates() -> list[str]:
     if local:
         found.extend(sorted(glob.glob(os.path.join(local, "OpenAI", "Codex", "bin", "*", "codex.exe"))))
     for name in (("codex.cmd", "codex.ps1", "codex.exe", "codex") if os.name == "nt" else ("codex",)):
-        # On Windows every PATH directory is searched as plain files (see path_files);
+        # Every PATH directory is searched (see path_files), on POSIX for executables;
         # all installs then compete on version below.
-        if os.name == "nt":
-            hits = path_files(name)
-        else:
-            hits = [hit] if (hit := shutil.which(name)) else []
+        hits = path_files(name)
+        if os.name != "nt":
+            hits = [hit for hit in hits if os.access(hit, os.X_OK)]
         for hit in hits:
             if os.name == "nt" and (is_script_shim(hit) or not os.path.splitext(hit)[1]):
                 # Extensionless `codex` on Windows is npm's sh shim for the same package.

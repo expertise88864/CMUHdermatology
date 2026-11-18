@@ -211,6 +211,26 @@ class ResumePlanTests(unittest.TestCase):
                         pr.resume_plan(plan_saved, 26, "o/r", "s", h2, False, requested)
 
 
+class ReviewLockTests(unittest.TestCase):
+    def test_second_review_in_the_same_checkout_is_blocked(self):
+        import tempfile
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as tmp, patch.object(pr, "ROOT", Path(tmp)):
+            lock = pr.acquire_lock()
+            with self.assertRaises(pr.Blocked):
+                pr.acquire_lock()
+            pr.release_lock(lock)
+            pr.release_lock(pr.acquire_lock())
+            self.assertFalse(lock.exists())
+
+    def test_main_is_pinned_before_fetching_a_pr_head(self):
+        source = (ROOT / "tools" / "pr_review.py").read_text(encoding="utf-8")
+        pinned = source.index('main_sha = git("rev-parse", "FETCH_HEAD")')
+        self.assertLess(pinned, source.index("head = historical_head(pr, head)"))
+        self.assertIn('base = git("merge-base", main_sha, head)', source)
+        self.assertNotIn('git("merge-base", git("rev-parse", "FETCH_HEAD"), head)', source)
+
+
 class TerminalQuotaTests(unittest.TestCase):
     """PR #17 review round 1 (P1): only the terminal provider error decides quota-pending."""
 

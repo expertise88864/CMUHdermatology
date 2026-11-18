@@ -46,6 +46,12 @@ elif command -v python3 >/dev/null 2>&1; then PYTHON="python3"
 else die "找不到 Python,無法驗證審查身分。"; fi
 STATE_DIR="$REPO_ROOT/.codex-review"
 mkdir -p "$STATE_DIR"
+# 同一 checkout 一次只跑一場審查:prompt/raw log/last message/identity 都是共用檔,
+# 兩場並行會讓一場驗證到另一場的 session 與裁決(2026-11-18)。mkdir 是原子操作。
+LOCK_DIR="$STATE_DIR/wrapper.lock"
+mkdir "$LOCK_DIR" 2>/dev/null \
+  || die "另一場審查正在使用 $STATE_DIR($LOCK_DIR 存在);確認沒有審查在跑後再刪除該目錄。"
+trap 'rmdir "$LOCK_DIR" 2>/dev/null' EXIT
 USAGE_TSV="$STATE_DIR/usage.tsv"
 SESSION_FILE="$STATE_DIR/last_session_id"
 PASS_FILE="$STATE_DIR/last_pass"
@@ -274,7 +280,7 @@ git -C "$REPO_ROOT" rev-parse --verify --quiet "${TIP}^{commit}" >/dev/null \
   || die "tip-ref '$TIP' 無法解析為 commit。"
 
 CTX_FILE="${3:-}"
-TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
+TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"; rmdir "$LOCK_DIR" 2>/dev/null' EXIT
 if [ -n "$CTX_FILE" ]; then
   [ -f "$CTX_FILE" ] || die "task-context 檔不存在:$CTX_FILE"
   if grep -qE '^(diff --git |@@ |index [0-9a-f]+\.\.)' "$CTX_FILE"; then
