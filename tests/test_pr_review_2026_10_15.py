@@ -204,7 +204,7 @@ class RecordRetryTests(unittest.TestCase):
             unrecorded = Path(tmp) / "pr_review_unrecorded.json"
             binding.write_text(json.dumps({"head": "b" * 40}), encoding="utf-8")
             entry = {"repo": "owner/repo", "pr": 7, "verdict": "APPROVE", "base": "c" * 40, "head": SHA,
-                     "session": "s", "bound_session": "s", "message": "APPROVE", "resume": True}
+                     "model": pr.MODEL, "effort": pr.EFFORT, "session": "s", "bound_session": "s", "message": "APPROVE", "resume": True}
             unrecorded.write_text(json.dumps(entry), encoding="utf-8")
             api, pull = FakeAPI(lambda path: None), {"number": 7}
             with patch.object(pr, "record", side_effect=pr.Blocked("HTTP 502")), \
@@ -226,6 +226,26 @@ class RecordRetryTests(unittest.TestCase):
             for pull, head in (({"number": 8}, SHA), ({"number": 7}, "b" * 40)):
                 with self.subTest(pull=pull, head=head), self.assertRaises(pr.Blocked):
                     pr.retry_record(FakeAPI(lambda path: None), pull, head, Path(tmp) / "b.json", unrecorded)
+
+
+    def test_retry_refuses_a_verdict_from_another_reviewer_profile(self):
+        # User decision 2026-11-18: a verdict saved by gpt-6.1-sol / xhigh (or with no
+        # profile at all) must not be posted as a codex-review/gpt-6.2-astra status.
+        import tempfile
+        from unittest.mock import patch
+        base = {"repo": "owner/repo", "pr": 7, "verdict": "APPROVE", "base": "c" * 40, "head": SHA,
+                "session": "s", "bound_session": "s", "message": "APPROVE", "resume": False}
+        for profile in ({}, {"model": "gpt-6.1-sol", "effort": "xhigh"},
+                        {"model": pr.MODEL, "effort": "xhigh"}, {"model": "gpt-6.1-sol", "effort": pr.EFFORT}):
+            with self.subTest(profile=profile), tempfile.TemporaryDirectory() as tmp:
+                unrecorded = Path(tmp) / "u.json"
+                unrecorded.write_text(json.dumps({**base, **profile}), encoding="utf-8")
+                with patch.object(pr, "record") as record, self.assertRaises(pr.Blocked):
+                    pr.retry_record(FakeAPI(lambda path: None), {"number": 7}, SHA,
+                                    Path(tmp) / "b.json", unrecorded)
+                record.assert_not_called()
+                self.assertFalse(pr.current_profile({**base, **profile}))
+        self.assertTrue(pr.current_profile({"model": pr.MODEL, "effort": pr.EFFORT}))
 
 
 class RebuttalTests(unittest.TestCase):

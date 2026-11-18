@@ -41,8 +41,13 @@ sid = os.environ["FIXTURE_SID"]
 context = {"cwd": str(root), "model": os.environ["FIXTURE_MODEL"],
            "effort": os.environ["FIXTURE_EFFORT"],
            "sandbox_policy": {"type": os.environ["FIXTURE_SANDBOX"]}, "turn_id": "fixture"}
-rows = [{"type": "session_meta", "payload": {"id": sid, "cwd": str(root)}},
-        {"type": "turn_context",
+rows = [{"type": "session_meta", "payload": {"id": sid, "cwd": str(root)}}]
+if os.environ.get("FIXTURE_PRIOR_MODEL"):
+    # An earlier turn of the same session, run by another reviewer profile.
+    rows.append({"type": "turn_context", "timestamp": "2026-10-20T00:00:00+00:00",
+                 "payload": dict(context, model=os.environ["FIXTURE_PRIOR_MODEL"],
+                                 effort=os.environ["FIXTURE_PRIOR_EFFORT"])})
+rows += [{"type": "turn_context",
          "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
          "payload": context}]
 sessions = pathlib.Path(os.environ["CODEX_HOME"]) / "sessions"
@@ -56,7 +61,8 @@ sys.exit(int(os.environ["FIXTURE_RC"]))
 
 class CodexReviewWrapperTests(unittest.TestCase):
     def run_wrapper(self, *, resume=False, recorded=None, count=0, returned=SID,
-                    model="gpt-6.2-astra", effort="medium", sandbox="read-only", rc=0):
+                    model="gpt-6.2-astra", effort="medium", sandbox="read-only", rc=0,
+                    prior=None):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory) / "repo"
             root.mkdir()
@@ -87,7 +93,9 @@ class CodexReviewWrapperTests(unittest.TestCase):
                        + os.pathsep + os.environ.get("PATH", ""),
                        CODEX_HOME=str(Path(directory) / "codex-home"),
                        CODEX_REVIEW_CLI="codex", FIXTURE_SID=returned, FIXTURE_MODEL=model,
-                       FIXTURE_EFFORT=effort, FIXTURE_SANDBOX=sandbox, FIXTURE_RC=str(rc))
+                       FIXTURE_EFFORT=effort, FIXTURE_SANDBOX=sandbox, FIXTURE_RC=str(rc),
+                       FIXTURE_PRIOR_MODEL=(prior or ("", ""))[0],
+                       FIXTURE_PRIOR_EFFORT=(prior or ("", ""))[1])
             env.pop("GIT_CONFIG_PARAMETERS", None)
             env.pop("BASH_ENV", None)
             args = ["tools/codex_review.sh"] + (["resume"] if resume else ["deep", "HEAD"])
@@ -144,6 +152,21 @@ class CodexReviewWrapperTests(unittest.TestCase):
         rc, called, sid, passes, out = self.run_wrapper(resume=True, recorded=SID, count=2)
         self.assertEqual((rc, sid, passes), (0, SID, "3"), out)
         self.assert_profile(called)
+
+    def test_resume_of_a_session_begun_by_a_retired_reviewer_never_counts(self):
+        # User decision 2026-11-18: a gpt-6.1-sol / xhigh first round resumed under
+        # gpt-6.2-astra / medium must not count; a fresh first round is required.
+        for prior in (("gpt-6.1-sol", "xhigh"), ("gpt-6.2-astra", "xhigh"), ("gpt-6.1-sol", "medium")):
+            with self.subTest(prior=prior):
+                rc, called, sid, passes, out = self.run_wrapper(resume=True, recorded=SID,
+                                                                count=2, prior=prior)
+                self.assertEqual((rc, passes), (4, "2"), out)
+                self.assertIsNotNone(called)
+
+    def test_resume_of_a_session_with_only_this_reviewer_counts(self):
+        rc, _, sid, passes, out = self.run_wrapper(resume=True, recorded=SID, count=1,
+                                                   prior=("gpt-6.2-astra", "medium"))
+        self.assertEqual((rc, sid, passes), (0, SID, "2"), out)
 
     def test_resume_returning_another_session_never_counts(self):
         rc, _, sid, passes, out = self.run_wrapper(resume=True, recorded=SID, count=1, returned=OTHER)

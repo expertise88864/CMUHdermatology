@@ -148,6 +148,15 @@ def verify(raw: Path, repo: Path, sessions: Path, started_at: float,
         raise ValueError(f"actual model/effort differs from {MODEL}/{EFFORT}")
     if context.get("sandbox_policy", {}).get("type") != "read-only":
         raise ValueError("actual review sandbox is not read-only")
+    # A resumed session must have been this reviewer from its first turn: a session
+    # begun under a retired profile (e.g. gpt-6.1-sol / xhigh) and resumed now would
+    # let an incremental resume claim the whole range for the configured reviewer.
+    for earlier in contexts:
+        payload = earlier.get("payload", {})
+        if payload.get("model") != MODEL or payload.get("effort") != EFFORT \
+                or payload.get("sandbox_policy", {}).get("type") != "read-only":
+            raise ValueError(f"session has a turn outside {MODEL}/{EFFORT}/read-only; "
+                             "run a fresh first round")
     return {"sessionId": sid, "tokensUsed": sum(numbers), "actualModel": MODEL,
             "actualEffort": EFFORT, "readOnly": True,
             "turnId": context.get("turn_id"), "contextTimestamp": latest["timestamp"],

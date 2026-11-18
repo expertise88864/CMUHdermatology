@@ -339,12 +339,22 @@ def finish(api: API, pr: dict, entry: dict, binding: Path, unrecorded: Path) -> 
     return {"APPROVE": 0, "REQUEST_CHANGES": 2, "QUOTA_PENDING": 3}.get(verdict, 1)
 
 
+def current_profile(entry: dict) -> bool:
+    """A saved verdict was produced by the configured reviewer (user decision 2026-11-18).
+    Verdicts saved without a profile, or by a retired one, must never be posted under
+    the current status context."""
+    return entry.get("model") == MODEL and entry.get("effort") == EFFORT
+
+
 def retry_record(api: API, pr: dict, head: str, binding: Path, unrecorded: Path) -> int:
     if not unrecorded.is_file():
         raise Blocked("No unrecorded verdict in this checkout")
     entry = json.loads(unrecorded.read_text(encoding="utf-8"))
     if entry.get("repo") != api.repo or entry.get("pr") != pr["number"] or entry.get("head") != head:
         raise Blocked("The unrecorded verdict is for another PR or head")
+    if not current_profile(entry):
+        raise Blocked(f"The unrecorded verdict was not produced by {MODEL}/{EFFORT}; "
+                      "run a fresh first round instead")
     return finish(api, pr, entry, binding, unrecorded)
 
 
@@ -398,7 +408,8 @@ def main() -> int:
         unrecorded = ROOT / ".codex-review" / "pr_review_unrecorded.json"
         if args.retry_record:
             return retry_record(api, pr, head, binding, unrecorded)
-        if unrecorded.is_file() and json.loads(unrecorded.read_text(encoding="utf-8")).get("head") == head:
+        pending_entry = json.loads(unrecorded.read_text(encoding="utf-8")) if unrecorded.is_file() else {}
+        if pending_entry.get("head") == head and current_profile(pending_entry):
             raise Blocked("A verdict for this head was not recorded on GitHub; run --retry-record")
         resume_session = None
         previous_head = None
@@ -426,7 +437,7 @@ def main() -> int:
         # Keep the verdict until GitHub has it: a failed POST is retried with
         # --retry-record instead of being lost (or blocking the next --resume).
         entry = {"repo": api.repo, "pr": pr["number"], "verdict": verdict, "base": base, "head": head,
-                 "session": session, "bound_session": resume_session or session,
+                 "model": MODEL, "effort": EFFORT, "session": session, "bound_session": resume_session or session,
                  "message": message, "resume": args.resume, "rebuttal": bool(rebuttal),
                  "same_head_rebuttal": bool(rebuttal) and previous_head is None}
         unrecorded.write_text(json.dumps(entry), encoding="utf-8")
