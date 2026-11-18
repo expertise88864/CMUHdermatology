@@ -56,14 +56,26 @@ def is_script_shim(path: str) -> bool:
 
 
 def native_for_shim(shim: str) -> list[str]:
-    """The native codex.exe shipped in the npm package behind a PATH shim
-    (`<npm>/node_modules/@openai/codex/.../vendor/<triple>/bin/codex.exe`)."""
-    package = os.path.join(os.path.dirname(shim), "node_modules", "@openai", "codex")
+    """The native codex.exe shipped in the npm package behind a PATH shim.
+
+    Global prefix: the shim sits beside `node_modules` (`<npm>/codex.cmd`).
+    Project-local install: the shim sits in `node_modules/.bin`, so the package's
+    `node_modules` is the shim directory's parent. The platform package may be
+    nested under `@openai/codex` or hoisted next to it (bin/codex.js resolves it
+    with require.resolve), so both places are searched."""
+    shim_dir = os.path.dirname(shim)
+    if os.path.basename(shim_dir).lower() == ".bin":
+        modules = os.path.dirname(shim_dir)
+    else:
+        modules = os.path.join(shim_dir, "node_modules")
+    package = os.path.join(modules, "@openai", "codex")
+    exe = ("vendor", "*", "bin", "codex.exe")
     patterns = (
-        os.path.join(package, "node_modules", "@openai", "codex-win32-*", "vendor", "*", "bin", "codex.exe"),
-        os.path.join(package, "vendor", "*", "bin", "codex.exe"),
+        os.path.join(package, "node_modules", "@openai", "codex-win32-*", *exe),
+        os.path.join(modules, "@openai", "codex-win32-*", *exe),
+        os.path.join(package, *exe),
     )
-    return sorted(hit for pattern in patterns for hit in glob.glob(pattern))
+    return sorted({hit for pattern in patterns for hit in glob.glob(pattern)})
 
 
 def codex_candidates() -> list[str]:
@@ -74,7 +86,8 @@ def codex_candidates() -> list[str]:
     local = os.environ.get("LOCALAPPDATA", "")
     if local:
         found.extend(sorted(glob.glob(os.path.join(local, "OpenAI", "Codex", "bin", "*", "codex.exe"))))
-    for name in (("codex.cmd", "codex.exe", "codex") if os.name == "nt" else ("codex",)):
+    # codex.ps1 is queried by name: which("codex") finds it only when .PS1 is in PATHEXT.
+    for name in (("codex.cmd", "codex.ps1", "codex.exe", "codex") if os.name == "nt" else ("codex",)):
         hit = shutil.which(name)
         if not hit:
             continue

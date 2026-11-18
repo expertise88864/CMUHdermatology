@@ -221,14 +221,20 @@ class NativeCliSelectionTests(unittest.TestCase):
         spec.loader.exec_module(module)
         return module
 
-    def _layout(self, root: Path, native: bool) -> Path:
-        npm = root / "npm"
-        npm.mkdir()
+    NESTED = "node_modules/@openai/codex/node_modules/@openai/codex-win32-x64"
+    HOISTED = "node_modules/@openai/codex-win32-x64"
+
+    def _layout(self, root: Path, native: bool, shim_dir: str = "npm",
+                package: str = NESTED) -> Path:
+        """`shim_dir` holds the shims; `package` (relative to the directory that
+        contains node_modules) holds the platform package with the native exe."""
+        npm = root / shim_dir
+        npm.mkdir(parents=True)
         for name in ("codex.cmd", "codex.ps1", "codex"):
             (npm / name).write_text("@ECHO off\n", encoding="utf-8")
         if native:
-            exe = (npm / "node_modules/@openai/codex/node_modules/@openai/codex-win32-x64"
-                   / "vendor/x86_64-pc-windows-msvc/bin/codex.exe")
+            prefix = npm.parent.parent if npm.name == ".bin" else npm
+            exe = prefix / package / "vendor/x86_64-pc-windows-msvc/bin/codex.exe"
             exe.parent.mkdir(parents=True)
             exe.write_bytes(b"MZ")
         return npm
@@ -244,13 +250,19 @@ class NativeCliSelectionTests(unittest.TestCase):
 
     def test_npm_shim_resolves_to_the_native_exe(self):
         identity = self._identity()
-        for shim in ("codex.cmd", "codex"):
-            with self.subTest(shim=shim), tempfile.TemporaryDirectory() as tmp:
-                npm = self._layout(Path(tmp), native=True)
-                path, version = self._select(identity, npm, shim)
-                self.assertTrue(path.lower().endswith("codex.exe"), path)
-                self.assertFalse(identity.is_script_shim(path))
-                self.assertEqual(version, "codex-cli 0.169.1")
+        # Global prefix and project-local node_modules/.bin; nested or hoisted
+        # platform package; each shim (including codex.ps1) as the only PATH hit.
+        layouts = (("npm", self.NESTED), ("npm", self.HOISTED),
+                   ("proj/node_modules/.bin", self.NESTED), ("proj/node_modules/.bin", self.HOISTED))
+        for shim_dir, package in layouts:
+            for shim in ("codex.cmd", "codex.ps1", "codex"):
+                with self.subTest(shim_dir=shim_dir, package=package, shim=shim), \
+                        tempfile.TemporaryDirectory() as tmp:
+                    npm = self._layout(Path(tmp), True, shim_dir, package)
+                    path, version = self._select(identity, npm, shim)
+                    self.assertTrue(path.lower().endswith("codex.exe"), path)
+                    self.assertFalse(identity.is_script_shim(path))
+                    self.assertEqual(version, "codex-cli 0.169.1")
 
     def test_shim_without_native_exe_is_never_selected(self):
         identity = self._identity()
