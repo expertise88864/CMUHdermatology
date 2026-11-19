@@ -90,30 +90,30 @@ class TestSafeRanges:
 
 class TestBuildOverride:
     def test_the_written_file_is_accepted_by_the_main_program(self, tool, clean_hc):
-        data, err = tool.build_override(hc, None, {"MENU_ID_代碼輸入": 221})
+        data, err = tool.build_override(hc, None, {"MENU_ID_代碼輸入": 222})
         assert err == ""
         assert data["for_calibration"] == hc.override_marker()
         tool.write_override(hc, data)
         m = importlib.reload(hc)
-        assert m.MENU_ID_代碼輸入 == 221
+        assert m.MENU_ID_代碼輸入 == 222
         assert m.OVERRIDE_ERROR == "" and "MENU_ID_代碼輸入" in m.OVERRIDE_NOTE
 
     def test_a_current_file_is_merged(self, tool):
-        old = {"for_calibration": hc.override_marker(), "MENU_ID_同意書": 673}
-        data, err = tool.build_override(hc, old, {"MENU_ID_代碼輸入": 221})
-        assert err == "" and data["MENU_ID_同意書"] == 673 and data["MENU_ID_代碼輸入"] == 221
+        old = {"for_calibration": hc.override_marker(), "MENU_ID_同意書": 674}
+        data, err = tool.build_override(hc, old, {"MENU_ID_代碼輸入": 222})
+        assert err == "" and data["MENU_ID_同意書"] == 674 and data["MENU_ID_代碼輸入"] == 222
 
     def test_a_stale_file_is_not_revived(self, tool):
         """★過期檔的其他鍵是上一個校正時代的值★:合併後蓋上新戳記等於把舊值復活。"""
         stale = {"for_calibration": "1150629#3", "MENU_ID_同意書": 670}
-        data, err = tool.build_override(hc, stale, {"MENU_ID_代碼輸入": 221})
+        data, err = tool.build_override(hc, stale, {"MENU_ID_代碼輸入": 222})
         assert err == "" and "MENU_ID_同意書" not in data
 
     def test_the_tool_never_writes_the_calibrated_version(self, tool):
         """[外審 PR #10 第 1 輪] 按過「重新校正」的機器以基線檔為準,override 的
         CALIBRATED_VERSION 蓋不過它 → 工具不提供「記為校正版本」(會謊報成功),
         改版通知一律走主程式的「重新校正」。"""
-        data, err = tool.build_override(hc, None, {"MENU_ID_同意書": 673})
+        data, err = tool.build_override(hc, None, {"MENU_ID_同意書": 674})
         assert err == "" and "CALIBRATED_VERSION" not in data
         src = open(os.path.join(ROOT, TOOL_NAME), encoding="utf-8").read()
         assert '"CALIBRATED_VERSION"]' not in src and "重新校正" in src
@@ -133,12 +133,12 @@ class TestStatusLine:
 
     def test_valid(self, tool):
         st = tool.override_status(hc, {"for_calibration": hc.override_marker(),
-                                       "MENU_ID_同意書": 673})
-        assert "生效中" in st["text"] and "同意書=673" in st["text"]
+                                       "MENU_ID_同意書": 674})
+        assert "生效中" in st["text"] and "同意書=674" in st["text"]
 
     def test_stale_or_broken_is_shown_as_invalid(self, tool):
         assert "無效" in tool.override_status(hc, {"for_calibration": "x#1",
-                                                  "MENU_ID_同意書": 673})["text"]
+                                                  "MENU_ID_同意書": 674})["text"]
         assert "無效" in tool.override_status(hc, {"_讀取失敗": "JSONDecodeError"})["text"]
 
     def test_a_broken_file_reads_as_invalid_not_as_missing(self, tool, clean_hc):
