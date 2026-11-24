@@ -1,4 +1,7 @@
 """Tie breakers after the existing VS objective has reached its optimum."""
+from fractions import Fraction
+from math import lcm
+
 from .weekend_share import counted_blocks, vs_targets
 
 
@@ -24,13 +27,17 @@ def _cumulative_deviation(model, x, ctx):
     targets = vs_targets(ctx, len(blocks))
     if not targets or not blocks:
         return None
-    costs = {p: [round(10 * (int(ctx.weekend_prior.get(p, 0)) + n - t)) ** 2
-                 for n in range(len(blocks) + 1)] for p, t in targets.items()}
+    # (已值＋n−目標)² 去掉與 n 無關的常數,再乘公分母 → 精確整數,不因捨入變成同分
+    gaps = {p: int(ctx.weekend_prior.get(p, 0)) - Fraction(t).limit_denominator(100_000)
+            for p, t in targets.items()}
+    scale = lcm(*(g.denominator for g in gaps.values()))
+    costs = {p: [int(scale * (n * n + 2 * n * g)) for n in range(len(blocks) + 1)]
+             for p, g in gaps.items()}
     terms = []
     for p, table in costs.items():
         count = model.NewIntVar(0, len(blocks), f"vs_year_n_{p}")
         model.Add(count == sum(x[b.saturday, p] for b in blocks))
-        cost = model.NewIntVar(0, max(table), f"vs_year_{p}")
+        cost = model.NewIntVar(min(table), max(table), f"vs_year_{p}")
         model.AddElement(count, table, cost)
         terms.append(cost)
     return sum(terms), lambda a: sum(

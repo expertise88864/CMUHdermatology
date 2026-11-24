@@ -95,3 +95,35 @@ def test_service_counts_vs_month_files(tmp_path):
 def test_r_context_is_unchanged(tmp_path):
     ctx = _service(tmp_path).build_context("r", "2026-10")
     assert ctx.weekend_expected is None and ws.vs_targets(ctx, 4) == {}
+
+
+def test_reopening_a_finished_month_ignores_later_joiners():
+    """[PR #31 審查] 回頭看 8 月:之後才加入的人那個月目標是 0。"""
+    ctx = SolveContext("vs", 2026, 8, members=[Member(p, p) for p in NOW],
+                       weekend_expected=dict.fromkeys(NOW, 0.0)).prepare()
+    duty = {d: OLD[i % 5] for i, d in enumerate(ctx.days)}
+    rows = {r["id"]: r for r in ws.year_summary(ctx, duty)}
+    assert rows["D"]["to_date"] == 1.0
+    assert rows["T"]["to_date"] == rows["T"]["year"] == 0
+    part = {r["id"]: r for r in ws.year_summary(ctx, {})}       # 還沒排:新成員要算
+    assert part["T"]["to_date"] == 0.7
+
+
+def test_small_target_differences_survive_the_integer_costs():
+    """[PR #31 審查] 目標差 0.03 次也要分得出先後。"""
+    from cmuh_common.roster.vs_preferences import _cumulative_deviation
+    from ortools.sat.python import cp_model
+    ids = ["A", "B"]
+    ctx = _ctx({"A": 6}, {"A": 18 / 5 + 17 / 7, "B": 0.0}, ids)
+    sats = [b.saturday for b in ctx.blocks if b.saturday]
+    model = cp_model.CpModel()
+    x = {(d, p): model.NewBoolVar(f"{d}{p}") for d in ctx.days for p in ids}
+    _expr, score = _cumulative_deviation(model, x, ctx)
+
+    def give(n_a):
+        return score({(d, p): int((p == "A") == (i < n_a))
+                      for i, d in enumerate(sats) for p in ids})
+    assert give(2) < give(1) and give(2) < give(3)
+    ctx.weekend_expected = {"A": 6.0, "B": -0.029}              # 幾乎同分仍有先後
+    ctx.weekend_prior = {"A": 6, "B": 0}
+    assert give(2) != give(1)

@@ -225,9 +225,18 @@ def year_summary(ctx, duty_this_month: dict) -> list:
                                          ctx.weekend_exempt), weights)
     if is_vs:
         to_date = vs_targets(ctx, len(blocks))
+        people = set(weights)
+        if all(duty_this_month.get(d) for d in ctx.days):
+            # 整月已排好(回頭看舊月份):只由那個月在輪的人分,之後才加入的不算
+            working = set(duty_this_month.values())
+            people = working | {p for p, n in (ctx.weekend_expected or {}).items() if n > 0}
+            to_date = {m.id: float((ctx.weekend_expected or {}).get(m.id, 0.0))
+                       + (len(blocks) / len(people) if m.id in people else 0.0)
+                       for m in ctx.members}
         rest = cycle_year_units([x for x in full_cycle_months(ym) if x > ym],
                                 ctx.holidays, ctx.weekend_exempt)
-        year = {mid: t + rest / len(weights) for mid, t in to_date.items()}
+        year = {mid: t + (rest / len(people) if mid in people else 0.0)
+                for mid, t in to_date.items()}
     rows = []
     for m in ctx.members:
         if m.id not in weights:
