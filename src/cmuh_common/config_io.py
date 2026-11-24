@@ -50,10 +50,12 @@ def load_json_dict(path: str, default: dict | None = None, *,
     return load_json_dict_ex(path, default, merge_defaults=merge_defaults)[0]
 
 
-def load_json_list_ex(path: str, default: list | None = None) -> tuple:
+def load_json_list_ex(path: str, default: list | None = None, *,
+                      backup_on_corrupt: bool = True) -> tuple:
     """同 load_json_list,但額外回傳載入狀態:(list, status)。理由同 load_json_dict_ex ——
     「暫時讀不到」與「沒有資料」都回預設值時,呼叫端會拿預設值去覆寫使用者的真實設定。"""
-    data, status = safe_load_json_ex(path, default=None)
+    data, status = safe_load_json_ex(path, default=None,
+                                     backup_on_corrupt=backup_on_corrupt)
     if isinstance(data, list):
         return data, status
     if data is not None:

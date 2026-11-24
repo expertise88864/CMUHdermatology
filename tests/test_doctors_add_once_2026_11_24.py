@@ -48,9 +48,29 @@ def test_same_name_with_another_code_is_corrected_not_duplicated(tmp_path):
 def test_fresh_install_already_has_both(tmp_path):
     rows, _p = _load(tmp_path)
     assert {"D34257", "D35819"} <= set(_codes(rows))
-    # [PR #30 審查] 第一次存檔就刪掉的,不可以再被加回來
-    rows, _p = _load(tmp_path, [r for r in rows if r["doc_no"] != "D34257"])
-    assert "D34257" not in _codes(rows)
+    # [PR #30 審查] 還沒存過檔不留記號:之後才還原回來的舊清單仍要補
+    assert not (tmp_path / aps._DOCTORS_ADD_ONCE_MARK).exists()
+
+
+def test_correcting_one_never_loses_the_other(tmp_path):
+    """[PR #30 審查] 唯一一列是「蔡明洋 D35819」:改完代號後另一位仍要補上。"""
+    rows, _p = _load(tmp_path, [{"name": "蔡明洋", "doc_no": "D35819", "notifications": False}])
+    assert {(r["name"], r["doc_no"]) for r in rows} == {
+        ("蔡明洋", "D34257"), ("李威儒", "D35819")}
+
+
+def test_a_denied_write_with_a_repair_still_loads(tmp_path, monkeypatch):
+    monkeypatch.setattr(aps, "atomic_write_json",
+                        lambda *a, **k: (_ for _ in ()).throw(PermissionError("鎖住")))
+    rows, _p = _load(tmp_path, [{"name": "D00001", "doc_no": "測試甲", "notifications": True}])
+    assert len(rows) == 3
+
+
+def test_a_corrupt_pre_transaction_backup_is_not_renamed(tmp_path):
+    p = tmp_path / "doctors.json.rollback.bak"
+    p.write_text("{ 壞掉", encoding="utf-8")
+    aps.load_doctors_settings(str(p))
+    assert [f.name for f in tmp_path.glob('doctors*')] == [p.name]
 
 
 def test_a_denied_write_still_loads_and_retries_later(tmp_path, monkeypatch):

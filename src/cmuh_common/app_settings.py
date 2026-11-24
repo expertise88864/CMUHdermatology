@@ -458,16 +458,18 @@ def _add_required_doctors_once(target: str, rows: list) -> tuple:
     if os.path.basename(target) != "doctors.json" or os.path.exists(mark):
         return rows, False, None          # 已補過,或目前讀的是交易前備份
     out, changed = [dict(r) for r in rows], False
-    for need in (d for d in DEFAULT_DOCTOR_SETTINGS if d["doc_no"] in _DOCTORS_ADD_ONCE):
-        if any(str(r.get("doc_no")).upper() == need["doc_no"] for r in out):
-            continue
-        # 同名但代號不同:查掛號用的是代號 → 改成指定代號,通知設定保留
-        same = next((r for r in out if r.get("name") == need["name"]), None)
-        if same is not None:
-            same["doc_no"] = need["doc_no"]
-        else:
+    needs = [d for d in DEFAULT_DOCTOR_SETTINGS if d["doc_no"] in _DOCTORS_ADD_ONCE]
+    # 先把同名但代號不同的改成指定代號(查掛號用的是代號;通知設定保留),
+    # 全部改完再補缺的 —— 否則改掉的那個代號可能正是另一位的。
+    for need in needs:
+        same = [r for r in out if r.get("name") == need["name"]]
+        if same and all(str(r.get("doc_no")).upper() != need["doc_no"] for r in same):
+            same[0]["doc_no"] = need["doc_no"]
+            changed = True
+    for need in needs:
+        if all(str(r.get("doc_no")).upper() != need["doc_no"] for r in out):
             out.append(dict(need))
-        changed = True
+            changed = True
     return out, changed, mark
 
 
@@ -475,7 +477,10 @@ def load_doctors_settings(path: str | None = None) -> list:
     """Load doctor rows and repair historical swapped name/doc_no values."""
     target = _path(path, "doctors.json")
     defaults = DEFAULT_DOCTOR_SETTINGS
-    data, _st = load_json_list_ex(target, defaults)
+    # 交易前備份是復原用的原檔:壞了也不改名、不寫回
+    snapshot = str(target).endswith(".rollback.bak")
+    data, _st = (load_json_list_ex(target, defaults, backup_on_corrupt=False)
+                 if snapshot else load_json_list_ex(target, defaults))
     _note_load_status("doctors.json", _st)
     normalized, fixed = normalize_doctor_rows(data, defaults)
     # [2026-07-26 審查] 讀不到就【絕不】寫回:這條「正規化後順手修檔」的路徑在
@@ -484,21 +489,12 @@ def load_doctors_settings(path: str | None = None) -> list:
     if fixed and _st == "error":
         logging.error("doctors.json 暫時讀不到 → 跳過正規化寫回(避免把醫師清單覆蓋成預設)")
         fixed = False
-    # 交易前備份是復原用的原檔,只讀不寫(清單照樣回傳整理過的)
-    if str(target).endswith(".rollback.bak"):
+    if snapshot:
         return normalized
     mark, added = None, False
     if _st == "ok":
         normalized, added, mark = _add_required_doctors_once(target, normalized)
-    elif _st == "missing":          # 全新安裝:預設已含這兩位 → 直接算補過
-        _rows, _added, mark = _add_required_doctors_once(target, normalized)
-    if added and not fixed:
-        try:
-            atomic_write_json(target, normalized)
-        except OSError:             # 補不進檔不影響使用,下次啟動再試(不留記號)
-            logging.warning("[doctors] 補醫師寫檔失敗,下次再試", exc_info=True)
-            return normalized
-    if fixed:
+    if fixed or added:
         # [IE-11 2026-07-12] 若正規化結果退回預設(原檔形狀全錯被整個丟棄)且原檔確有異於預設的
         # 內容 → 覆寫前先備份成 .invalid-<ts>,免 OneDrive 還原的舊格式檔被靜默清空無法救回。
         if normalized == defaults and data != defaults:
@@ -511,7 +507,11 @@ def load_doctors_settings(path: str | None = None) -> list:
                     os.replace(target, dest)
             except OSError:
                 logging.debug("[doctors] 備份 .invalid 失敗", exc_info=True)
-        atomic_write_json(target, normalized)
+        try:
+            atomic_write_json(target, normalized)
+        except OSError:             # 寫不進檔不影響使用,下次啟動再試(不留記號)
+            logging.warning("[doctors] 醫師清單寫回失敗,下次再試", exc_info=True)
+            return normalized
     if mark:
         try:
             atomic_write_json(mark, {"added": list(_DOCTORS_ADD_ONCE)})
