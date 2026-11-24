@@ -327,6 +327,17 @@ class CalendarDutyTab(ttk.Frame):
             self._wk.heading(c, text=t)
             self._wk.column(c, width=w, anchor="w" if c == "who" else "center")
         self._wk.pack(fill="x", padx=6)
+        # [2026-11-24 使用者] 三線也統計;加入之前的月份不算
+        ttk.Label(parent, text="VS 年度週末（本週期；加入後才計）",
+                  font=(OVR_FONT, 10, "bold")
+                  ).pack(anchor="w", padx=6, pady=(8, 0))
+        self._wk_vs = ttk.Treeview(parent, columns=("who", "done", "to", "yr"),
+                                   show="headings", height=7)
+        for c, t, w in (("who", "主治醫師", 110), ("done", "已值", 40),
+                        ("to", "至本月目標", 66), ("yr", "全年目標", 58)):
+            self._wk_vs.heading(c, text=t)
+            self._wk_vs.column(c, width=w, anchor="w" if c == "who" else "center")
+        self._wk_vs.pack(fill="x", padx=6)
         ttk.Label(parent, text="警告", font=(OVR_FONT, 10, "bold")
                   ).pack(anchor="w", padx=6, pady=(8, 0))
         self._warns = tk.Listbox(parent, height=8, width=34)
@@ -352,21 +363,21 @@ class CalendarDutyTab(ttk.Frame):
             self._bx.insert("", "end", values=(who, int(counts.get(m.id, 0))))
 
     def _reload_weekend_year(self, ctx, month: dict) -> None:
-        """R 年度週末：已值／至本月目標／全年目標（service.weekend_year_summary）。"""
-        if not getattr(self, "_wk", None):
+        """年度週末：已值／至本月目標／全年目標（service.weekend_year_summary）。"""
+        tree = getattr(self, "_wk" if ctx.scope == "r" else "_wk_vs", None)
+        if not tree:
             return
         from cmuh_common.roster.weekend_share import duty_map
-        self._wk.delete(*self._wk.get_children())
+        tree.delete(*tree.get_children())
         try:
-            rows = self.service.weekend_year_summary(ctx, duty_map(month, "r"))
+            rows = self.service.weekend_year_summary(ctx, duty_map(month, ctx.scope))
         except Exception:  # noqa: BLE001 —— 顯示失敗不可擋住整個分頁
             logging.exception("[roster.ui] 年度週末統計失敗（略過）")
             rows = []
         for r in rows:
-            who = (f"{r['id']} {r['name']}（{r['level']}）" if r["name"]
-                   else f"{r['id']}（{r['level']}）")
-            self._wk.insert("", "end", values=(who, r["done"], r["to_date"],
-                                               r["year"]))
+            level = f"（{r['level']}）" if ctx.scope == "r" else ""
+            who = f"{r['id']} {r['name']}{level}" if r["name"] else f"{r['id']}{level}"
+            tree.insert("", "end", values=(who, r["done"], r["to_date"], r["year"]))
 
     # ── 資料 → 畫面 ──────────────────────────────────────────────────────
     def _member_map(self, scope: str) -> dict:
@@ -452,7 +463,8 @@ class CalendarDutyTab(ttk.Frame):
         for s in ("r", "vs"):
             self._refresh_side(ctxs[s], members[s], self._sum[s], tallies[s])
         self._reload_biopsy_counts(ctx_r)
-        self._reload_weekend_year(ctx_r, month)
+        for s in ("r", "vs"):
+            self._reload_weekend_year(ctxs[s], month)
         self._refresh_warnings()
         self._apply_finalized_state()
 

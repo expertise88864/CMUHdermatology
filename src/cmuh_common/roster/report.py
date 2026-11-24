@@ -109,7 +109,7 @@ def build_report(ctx: SolveContext, result, scope_label: str) -> str:
         if result.last_weekend:
             lines.append(f"  最後週末: {result.last_weekend['saturday']} → "
                          f"{result.last_weekend['person']}（供下月色塊/銜接）")
-        # [2026-10-19 使用者] R 年度週末(8 月～隔年 7 月;春節等不計入)
+        # [2026-10-19 使用者] 年度週末(R;2026-11-24 起含 VS。8 月～隔年 7 月;春節等不計入)
         rows = year_summary(ctx, dict(result.assignments))
         if rows:
             from cmuh_common.roster.cycle import cycle_label  # noqa: PLC0415

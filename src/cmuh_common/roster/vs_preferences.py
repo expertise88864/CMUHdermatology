@@ -1,4 +1,5 @@
 """Tie breakers after the existing VS objective has reached its optimum."""
+from .weekend_share import counted_blocks, vs_targets
 
 
 # [2026-11-24 使用者] 三線平日順序(0=週一;前面的優先)。五六日不設,按點數平衡。
@@ -13,6 +14,27 @@ def _weekday_points(d, member_id, holidays) -> int:
     if d in holidays or member_id not in order:
         return 0
     return _RANK_POINTS[order.index(member_id)]
+
+
+def _cumulative_deviation(model, x, ctx):
+    """[2026-11-24 使用者] 年度週末:(已值＋本月 − 目標) 平方和 → (算式, 計分函式)。
+
+    用平方:少兩次的人要比少一次的人先補(絕對值會把兩者看成一樣好)。"""
+    blocks = counted_blocks(ctx.blocks, ctx.weekend_exempt, ctx.holidays)
+    targets = vs_targets(ctx, len(blocks))
+    if not targets or not blocks:
+        return None
+    costs = {p: [round(10 * (int(ctx.weekend_prior.get(p, 0)) + n - t)) ** 2
+                 for n in range(len(blocks) + 1)] for p, t in targets.items()}
+    terms = []
+    for p, table in costs.items():
+        count = model.NewIntVar(0, len(blocks), f"vs_year_n_{p}")
+        model.Add(count == sum(x[b.saturday, p] for b in blocks))
+        cost = model.NewIntVar(0, max(table), f"vs_year_{p}")
+        model.AddElement(count, table, cost)
+        terms.append(cost)
+    return sum(terms), lambda a: sum(
+        table[sum(a[b.saturday, p] for b in blocks)] for p, table in costs.items())
 
 
 def refine_vs(model, solver, cp_model, status, objective, x, ctx):
@@ -33,14 +55,17 @@ def refine_vs(model, solver, cp_model, status, objective, x, ctx):
     points = {(d, m.id): v for d in ctx.days for m in ctx.members
               if (v := _weekday_points(d, m.id, ctx.holidays))}
     weekday = [-v * x[key] for key, v in points.items()]
+    cumulative = _cumulative_deviation(model, x, ctx)
     # Preserve a usable preceding solution if a lower-priority solve times out.
     saved = {key: solver.Value(var) for key, var in x.items()}
     def scores(assignment):
         counts = {m.id: sum(assignment[d, m.id] for d in anchors) for m in ctx.members}
         return (max(counts.values()) - min(counts.values()),
+                cumulative[1](assignment) if cumulative else
                 sum(n * ctx.prev_weekend_counts.get(p, 0) for p, n in counts.items()),
                 -sum(v * assignment[key] for key, v in points.items()))
-    for index, expression in enumerate((maximum - minimum, sum(history), sum(weekday))):
+    for index, expression in enumerate((
+            maximum - minimum, cumulative[0] if cumulative else sum(history), sum(weekday))):
         if isinstance(expression, int):
             continue
         model.Add(expression <= scores(saved)[index])

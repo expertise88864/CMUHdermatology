@@ -135,6 +135,38 @@ def duty_map(month_doc: dict, scope: str = "r") -> dict:
     return out
 
 
+def vs_expected(history, current) -> dict:
+    """VS 本月之前每位【目前成員】應值的週末次數 {member_id: 次(浮點)}。
+
+    history：由早到晚的 [(該月有值班的人, 該月有人值的週末總數)]。每個月的週末由
+    當時在輪的人均分。在輪 = 從本週期第一次值班那個月起(中間某月沒值班仍算);
+    已離開名單的人算到最後一次值班那個月。新加入的人因此從加入當月才開始累計,
+    不會被要求補之前的次數。"""
+    first: dict = {}
+    last: dict = {}
+    for i, (people, _n) in enumerate(history):
+        for mid in people:
+            first.setdefault(mid, i)
+            last[mid] = i
+    out = {mid: 0.0 for mid in current}
+    for i, (_people, units) in enumerate(history):
+        active = [mid for mid in first
+                  if first[mid] <= i and (mid in out or i <= last[mid])]
+        for mid in active:
+            if mid in out:
+                out[mid] += units / len(active)
+    return out
+
+
+def vs_targets(ctx, units_this_month: int) -> dict:
+    """VS 到本月底的累計目標 {member_id: 次(浮點)}；不適用 → 空。"""
+    if ctx.scope != "vs" or ctx.weekend_expected is None or not ctx.members:
+        return {}
+    share = units_this_month / len(ctx.members)
+    return {m.id: float(ctx.weekend_expected.get(m.id, 0.0)) + share
+            for m in ctx.members}
+
+
 def cumulative_targets(prior: dict, weights: dict, units_this_month: int) -> dict:
     """本月結束時，每人的累計週末目標 {member_id: 次(浮點)}。
 
@@ -166,7 +198,8 @@ def cycle_year_units(cycle_yms, holidays, exempt) -> int:
 
 
 def year_summary(ctx, duty_this_month: dict) -> list:
-    """R 年度週末統計（畫面/報告共用）→ [{id,name,level,done,to_date,year}]。
+    """年度週末統計（畫面/報告共用）→ [{id,name,level,done,to_date,year}]。R 依級別
+    權重；VS 由當時在輪的人均分(`vs_targets`)，year 假設之後人數不變。
 
     done＝本週期之前＋本月(duty_this_month: {date: member_id})已值的週末；
     to_date＝到本月為止依權重應值的次數；year＝整個週期(8–7 月)的目標。
@@ -175,6 +208,9 @@ def year_summary(ctx, duty_this_month: dict) -> list:
     weights = {m.id: float((ctx.weekend_weights or {}).get(m.id) or 0)
                for m in ctx.members}
     weights = {mid: w for mid, w in weights.items() if w > 0}
+    is_vs = ctx.scope == "vs" and ctx.weekend_expected is not None
+    if is_vs:
+        weights = {m.id: 1.0 for m in ctx.members}
     if not weights:
         return []
     blocks = counted_blocks(ctx.blocks, ctx.weekend_exempt, ctx.holidays)
@@ -187,6 +223,11 @@ def year_summary(ctx, duty_this_month: dict) -> list:
     to_date = cumulative_targets(ctx.weekend_prior, weights, len(blocks))
     year = year_targets(cycle_year_units(full_cycle_months(ym), ctx.holidays,
                                          ctx.weekend_exempt), weights)
+    if is_vs:
+        to_date = vs_targets(ctx, len(blocks))
+        rest = cycle_year_units([x for x in full_cycle_months(ym) if x > ym],
+                                ctx.holidays, ctx.weekend_exempt)
+        year = {mid: t + rest / len(weights) for mid, t in to_date.items()}
     rows = []
     for m in ctx.members:
         if m.id not in weights:

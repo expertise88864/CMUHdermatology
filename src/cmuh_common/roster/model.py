@@ -372,6 +372,10 @@ class SolveContext:
     weekend_exempt: set = field(default_factory=set)
     weekend_prior: dict = field(default_factory=dict)
     weekend_weights: dict = field(default_factory=dict)
+    # [2026-11-24 使用者] VS(三線)年度週末:本月之前每人【應值】次數 {member_id: 次}。
+    #   每個月的週末由當時在輪的人均分,加入之前的月份不算(見 weekend_share)。
+    #   None ＝ 不適用(R、或沒有週期資料的呼叫端)。
+    weekend_expected: "Optional[dict]" = None
     params: RosterParams = field(default_factory=RosterParams)
 
     # 建構後由 prepare() 填入

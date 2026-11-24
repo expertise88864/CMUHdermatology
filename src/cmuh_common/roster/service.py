@@ -65,6 +65,7 @@ from cmuh_common.roster.cycle import (
 )
 from cmuh_common.roster.weekend_share import (
     duty_map as _weekend_duty_map, level_weights as _weekend_level_weights,
+    vs_expected as _weekend_vs_expected,
     member_weights as _weekend_member_weights, month_units as _weekend_month_units,
 )
 from cmuh_common.roster.saturday_biopsy import HISTORY_KEEP_MONTHS as BIOPSY_HISTORY_KEEP_MONTHS
@@ -593,28 +594,31 @@ class RosterService:
 
     @staticmethod
     def weekend_year_summary(ctx: SolveContext, duty_this_month: dict) -> list:
-        """R 年度週末統計（見 weekend_share.year_summary；畫面與報告同一份）。"""
+        """年度週末統計（見 weekend_share.year_summary；畫面與報告同一份）。"""
         from cmuh_common.roster.weekend_share import year_summary  # noqa: PLC0415
         return year_summary(ctx, duty_this_month)
 
     @staticmethod
-    def _weekend_prior(st, ym: str, members, holidays, exempt) -> dict:
-        """本週期【本月之前】名單上每人已值的 R 週末次數 {member_id: 次}。
+    def _weekend_prior(st, ym: str, members, holidays, exempt,
+                       scope: str = "r") -> tuple:
+        """本週期【本月之前】→ (名單上每人已值的週末次數 {member_id: 次},
+        各月 [(有值班的人, 有人值的週末總數)])。
 
-        從各月檔的實際 r_duty 算(使用者在程式裡改的班表就是正本),以週六所在
+        從各月檔的實際班表算(使用者在程式裡改的班表就是正本),以週六所在
         月份計、不計入標「不計入年度週末」的週末塊(見 weekend_share)。
         離開名單的人不列(比例按當時在班的人重新分配)。"""
         ids = {mm.id for mm in members}
         out: dict = {}
+        history: list = []
         for pym in cycle_months(ym)[:-1]:
-            doc = st.load_month(pym)
-            units = _weekend_month_units(int(pym[:4]), int(pym[5:7]),
-                                         _weekend_duty_map(doc, "r"),
+            duty = _weekend_duty_map(st.load_month(pym), scope)
+            units = _weekend_month_units(int(pym[:4]), int(pym[5:7]), duty,
                                          holidays, exempt)
+            history.append((sorted(set(duty.values())), sum(units.values())))
             for mid, n in units.items():
                 if mid in ids:
                     out[mid] = out.get(mid, 0) + n
-        return out
+        return out, history
 
     def build_context(self, scope: str, ym: str, *,
                       month: "dict | None" = None,
@@ -727,16 +731,23 @@ class RosterService:
                 if _p4 and _d4 <= today:
                     past_duty[_d4] = _p4
         # ★[2026-10-19 使用者] R 年度週末★:春節等標「不計入年度週末」的日期、
-        #   本週期本月之前每人已值的週末次數、依級別的權重。VS 不適用。
+        #   本週期本月之前每人已值的週末次數、依級別的權重。
+        #   [2026-11-24 使用者] VS 也統計:每月由當時在輪的人均分。
         weekend_exempt: set = set()
         weekend_prior: dict = {}
         weekend_weights: dict = {}
         if scope == "r":
             weekend_exempt = set(holiday_table.get("weekend_exempt") or ())
-            weekend_prior = self._weekend_prior(st, ym, members, holidays,
-                                                weekend_exempt)
+            weekend_prior, _ = self._weekend_prior(st, ym, members, holidays,
+                                                   weekend_exempt)
             weekend_weights = _weekend_member_weights(
                 members, _weekend_level_weights(cfg))
+        weekend_expected = None
+        if scope == "vs":
+            weekend_exempt = set(holiday_table.get("weekend_exempt") or ())
+            weekend_prior, history = self._weekend_prior(
+                st, ym, members, holidays, weekend_exempt, "vs")
+            weekend_expected = _weekend_vs_expected(history, [x.id for x in members])
         ctx = SolveContext(
             scope=scope, year=y, month=m, members=members, holidays=holidays,
             leaves=leaves, must_duty=must, annual_holiday=annual, locks=locks,
@@ -745,7 +756,7 @@ class RosterService:
             prev_weekend_counts=prev_weekend_counts,
             past_cutoff=today, past_duty=past_duty,
             weekend_exempt=weekend_exempt, weekend_prior=weekend_prior,
-            weekend_weights=weekend_weights,
+            weekend_weights=weekend_weights, weekend_expected=weekend_expected,
             params=RosterParams.from_config(cfg))
         ctx.prepare()
         apply_boundary_from_prev(ctx)
