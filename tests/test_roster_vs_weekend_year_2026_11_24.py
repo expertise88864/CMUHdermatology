@@ -97,33 +97,40 @@ def test_r_context_is_unchanged(tmp_path):
     assert ctx.weekend_expected is None and ws.vs_targets(ctx, 4) == {}
 
 
-def test_reopening_a_finished_month_ignores_later_joiners():
-    """[PR #31 審查] 回頭看 8 月:之後才加入的人那個月目標是 0。"""
+@pytest.mark.parametrize("blank", [None, date(2026, 8, 5), date(2026, 8, 8)])
+def test_reopening_a_past_month_ignores_later_joiners(blank):
+    """[PR #31 審查] 回頭看 8 月(有一格空白也一樣):之後才加入的人那個月目標是 0。"""
     ctx = SolveContext("vs", 2026, 8, members=[Member(p, p) for p in NOW],
                        weekend_expected=dict.fromkeys(NOW, 0.0)).prepare()
-    duty = {d: OLD[i % 5] for i, d in enumerate(ctx.days)}
-    rows = {r["id"]: r for r in ws.year_summary(ctx, duty)}
+    duty = {d: OLD[i % 5] for i, d in enumerate(ctx.days) if d != blank}
+    rows = {r["id"]: r for r in ws.year_summary(ctx, duty, today=date(2026, 11, 24))}
     assert rows["D"]["to_date"] == 1.0
     assert rows["T"]["to_date"] == rows["T"]["year"] == 0
-    part = {r["id"]: r for r in ws.year_summary(ctx, {})}       # 還沒排:新成員要算
-    assert part["T"]["to_date"] == 0.7
+
+
+def test_planning_a_future_month_includes_new_members():
+    ctx = SolveContext("vs", 2026, 12, members=[Member(p, p) for p in NOW],
+                       weekend_expected=dict.fromkeys(NOW, 0.0)).prepare()
+    for duty in ({}, {date(2026, 12, 1): "D"}):
+        rows = {r["id"]: r for r in ws.year_summary(ctx, duty, today=date(2026, 11, 24))}
+        assert rows["T"]["to_date"] == 0.6
 
 
 def test_small_target_differences_survive_the_integer_costs():
-    """[PR #31 審查] 目標差 0.03 次也要分得出先後。"""
+    """[PR #31 審查] 目標差 0.029 次也要分得出先後(取到小數一位會變同分)。"""
     from cmuh_common.roster.vs_preferences import _cumulative_deviation
     from ortools.sat.python import cp_model
-    ids = ["A", "B"]
-    ctx = _ctx({"A": 6}, {"A": 18 / 5 + 17 / 7, "B": 0.0}, ids)
+    ids = list("ABCDEFGH")
+    base = 18 / 5 + 17 / 7
+    ctx = _ctx({"A": 6}, dict.fromkeys(ids, 0.0) | {"A": base}, ids)
     sats = [b.saturday for b in ctx.blocks if b.saturday]
     model = cp_model.CpModel()
     x = {(d, p): model.NewBoolVar(f"{d}{p}") for d in ctx.days for p in ids}
-    _expr, score = _cumulative_deviation(model, x, ctx)
+    deviation = _cumulative_deviation(model, x, ctx)
+    assert deviation
 
-    def give(n_a):
-        return score({(d, p): int((p == "A") == (i < n_a))
-                      for i, d in enumerate(sats) for p in ids})
-    assert give(2) < give(1) and give(2) < give(3)
-    ctx.weekend_expected = {"A": 6.0, "B": -0.029}              # 幾乎同分仍有先後
-    ctx.weekend_prior = {"A": 6, "B": 0}
-    assert give(2) != give(1)
+    def give(people):
+        return deviation[1]({(d, p): int(people[i] == p)
+                             for i, d in enumerate(sats) for p in ids})
+    assert len(sats) == 4
+    assert give("ABCD") < give("HBCD")      # 只差一個週末給舊成員 A 還是新成員 H

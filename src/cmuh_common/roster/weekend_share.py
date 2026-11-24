@@ -197,7 +197,7 @@ def cycle_year_units(cycle_yms, holidays, exempt) -> int:
     return total
 
 
-def year_summary(ctx, duty_this_month: dict) -> list:
+def year_summary(ctx, duty_this_month: dict, today: date | None = None) -> list:
     """年度週末統計（畫面/報告共用）→ [{id,name,level,done,to_date,year}]。R 依級別
     權重；VS 由當時在輪的人均分(`vs_targets`)，year 假設之後人數不變。
 
@@ -226,9 +226,11 @@ def year_summary(ctx, duty_this_month: dict) -> list:
     if is_vs:
         to_date = vs_targets(ctx, len(blocks))
         people = set(weights)
-        if all(duty_this_month.get(d) for d in ctx.days):
-            # 整月已排好(回頭看舊月份):只由那個月在輪的人分,之後才加入的不算
-            working = set(duty_this_month.values())
+        working = set(duty_this_month.values())
+        past = ctx.days[-1] < (today or date.today())
+        if working and (past or all(duty_this_month.get(b.saturday) for b in blocks)):
+            # 已過去的月份(有空格也一樣)或週末都排好的月份:只由那個月在輪的人分,
+            # 之後才加入的不算。還沒排好的未來月份 → 新成員要一起分。
             people = working | {p for p, n in (ctx.weekend_expected or {}).items() if n > 0}
             to_date = {m.id: float((ctx.weekend_expected or {}).get(m.id, 0.0))
                        + (len(blocks) / len(people) if m.id in people else 0.0)
