@@ -445,6 +445,26 @@ def load_threshold_settings(
     return out
 
 
+# [2026-11-24 使用者] 這兩位要在每台電腦的清單裡。原廠預設早就有,但存過檔的電腦只用
+#   自己那一份 → 對既有檔【補一次】。補過(或當時就已經有)留一個記號檔,之後使用者
+#   自己刪掉不會再被加回來。
+_DOCTORS_ADD_ONCE = ("D34257", "D35819")
+_DOCTORS_ADD_ONCE_MARK = "doctors_added_2026_11_24.json"
+
+
+def _add_required_doctors_once(target: str, rows: list) -> tuple:
+    """→ (補過的清單, 有沒有補, 記號檔路徑)。不寫檔;記號在清單寫好之後才留。"""
+    mark = os.path.join(os.path.dirname(target), _DOCTORS_ADD_ONCE_MARK)
+    if os.path.basename(target) != "doctors.json" or os.path.exists(mark):
+        return rows, False, None          # 已補過,或目前讀的是交易前備份
+    names = {str(r.get("name")) for r in rows}
+    codes = {str(r.get("doc_no")).upper() for r in rows}
+    added = [dict(d) for d in DEFAULT_DOCTOR_SETTINGS
+             if d["doc_no"] in _DOCTORS_ADD_ONCE
+             and d["doc_no"] not in codes and d["name"] not in names]
+    return rows + added, bool(added), mark
+
+
 def load_doctors_settings(path: str | None = None) -> list:
     """Load doctor rows and repair historical swapped name/doc_no values."""
     target = _path(path, "doctors.json")
@@ -458,6 +478,10 @@ def load_doctors_settings(path: str | None = None) -> list:
     if fixed and _st == "error":
         logging.error("doctors.json 暫時讀不到 → 跳過正規化寫回(避免把醫師清單覆蓋成預設)")
         fixed = False
+    mark = None
+    if _st == "ok":
+        normalized, added, mark = _add_required_doctors_once(target, normalized)
+        fixed = fixed or added
     if fixed:
         # [IE-11 2026-07-12] 若正規化結果退回預設(原檔形狀全錯被整個丟棄)且原檔確有異於預設的
         # 內容 → 覆寫前先備份成 .invalid-<ts>,免 OneDrive 還原的舊格式檔被靜默清空無法救回。
@@ -472,6 +496,11 @@ def load_doctors_settings(path: str | None = None) -> list:
             except OSError:
                 logging.debug("[doctors] 備份 .invalid 失敗", exc_info=True)
         atomic_write_json(target, normalized)
+    if mark:
+        try:
+            atomic_write_json(mark, {"added": list(_DOCTORS_ADD_ONCE)})
+        except OSError:
+            logging.warning("[doctors] 補醫師的記號寫不進去,下次啟動再試", exc_info=True)
     return normalized
 
 

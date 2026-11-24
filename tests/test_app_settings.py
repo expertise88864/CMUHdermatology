@@ -124,7 +124,7 @@ def test_load_doctors_settings_repairs_and_persists_swapped_rows():
 
         rows = load_doctors_settings(path)
 
-        assert rows == [{"name": "王小明", "doc_no": "D12345", "notifications": True}]
+        assert rows[:1] == [{"name": "王小明", "doc_no": "D12345", "notifications": True}]
         with open(path, encoding="utf-8") as handle:
             persisted = json.load(handle)
         assert persisted == rows
