@@ -331,12 +331,16 @@ class FixedWeekdayRule(Rule):
 
 def preferred_weekday_days(ctx, m, directives) -> list:
     """複選值班星期中，這個月還排得到他的日子（規則、理由標籤與報告共用）。"""
+    def taken(d):                              # 別人的固定值班日(硬性;他請假就不算)
+        return any(o.id != m.id and o.fixed_weekday == d.weekday()
+                   and not ctx.on_leave(o.id, d) for o in ctx.members)
     return [d for d in ctx.days
             if d.weekday() in m.fixed_weekdays
             and d not in ctx.holidays          # 假日歸年度指定表管
             and d not in directives            # 指定類優先
             and not ctx.on_leave(m.id, d)      # 請假最優先
-            and (ctx.past_cutoff is None or d > ctx.past_cutoff)]
+            and (ctx.past_cutoff is None or d > ctx.past_cutoff)
+            and not taken(d)]
 
 
 @register_rule
@@ -368,6 +372,8 @@ class PreferredWeekdaysRule(Rule):
             for d in ctx.days:
                 if d.weekday() not in m.fixed_weekdays or d in ctx.holidays:
                     continue
+                if ctx.past_cutoff is not None and d <= ctx.past_cutoff:
+                    continue                   # 過去是事實,不會再由誰代
                 if ctx.on_leave(m.id, d):
                     checks.append(Precheck(
                         "info", self.rule_id,

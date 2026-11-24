@@ -82,6 +82,10 @@ def test_a_single_fixed_weekday_of_someone_else_stays_hard():
     assert all(res.assignments[d] == "r1" for d in WED_THU if d.weekday() == 2)
     assert any("固定值班日" in c.msg for c in res.prechecks
                if c.rule_id == "preferred_weekdays")
+    # [PR #29 審查] 別人的固定日不算「可排」;對方請假那天才算
+    assert "可排 4 天，實排 4 天" in build_report(make_ctx(members=ms), res, "R 排班")
+    away = make_ctx(members=ms, leaves={"r2": {date(2026, 8, 6)}})
+    assert "可排 5 天" in build_report(away, solve_duty(away), "R 排班")
 
 
 def test_report_shows_how_many_preferred_days_were_met():
@@ -157,4 +161,44 @@ def test_settings_page_saves_and_lists_the_choice(tk_root, tmp_path, monkeypatch
     saved = storage.load_config()["r_members"][0]
     assert saved["fixed_weekdays"] == [2, 3] and saved["fixed_weekday"] is None
     assert tree.item("A", "values")[-1] == "三、四"
+    tab.destroy()
+
+
+def test_past_days_are_not_prechecked():
+    """[PR #29 審查] 今天以前是事實,不可以說「由其他人代」。"""
+    ctx = make_ctx(members=members(), leaves={"r1": {date(2026, 8, 5), date(2026, 8, 26)}})
+    ctx.past_cutoff = date(2026, 8, 10)
+    msgs = [c.msg for c in PreferredWeekdaysRule().precheck(ctx)]
+    assert any("8/26" in m for m in msgs) and not any("8/5 " in m for m in msgs)
+
+
+@pytest.mark.parametrize("toggles, single", [([], 5), ([0], 0), ([5], None)])
+def test_a_legacy_weekend_choice_is_kept_until_changed(tk_root, monkeypatch, toggles, single):
+    """[PR #29 審查] 舊設定選過週六:只改姓名不可以把它清掉;可以換掉或取消。"""
+    out = _dialog(tk_root, monkeypatch, {"id": "A", "name": "甲", "fixed_weekday": 5}, toggles)
+    assert (out["fixed_weekday"], out["fixed_weekdays"]) == (single, None)
+
+
+def test_a_concurrent_multi_choice_does_not_survive_beside_a_single_one(
+        tk_root, tmp_path, monkeypatch):
+    """[PR #29 審查] 視窗開著時他機存了三、四;本機改成只選一 → 整組以本機為準。"""
+    from cmuh_common.roster.service import RosterService
+    from cmuh_common.roster.storage import RosterStorage
+    from cmuh_common.roster.ui import settings as st
+    storage = RosterStorage(str(tmp_path))
+    storage.save_config({"r_members": [{"id": "A", "name": "甲", "level": "R1"}],
+                         "vs_members": []})
+    tab = st.SettingsTab(tk_root, RosterService(storage))
+    tab._member_trees["r"][0].selection_set("A")
+
+    def drive(dlg, _win=None):
+        cfg = storage.load_config()
+        cfg["r_members"][0]["fixed_weekdays"] = [2, 3]
+        storage.save_config(cfg)
+        dlg._wd[0].set(True)
+        dlg._ok()
+    monkeypatch.setattr(st._MemberDialog, "wait_window", drive)
+    tab._member_edit("r")
+    m = Member.from_dict(storage.load_config()["r_members"][0])
+    assert (m.fixed_weekday, m.fixed_weekdays) == (0, ())
     tab.destroy()

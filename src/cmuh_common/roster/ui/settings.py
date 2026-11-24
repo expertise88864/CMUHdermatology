@@ -88,9 +88,11 @@ class _MemberDialog(tk.Toplevel):
             chosen = _member_weekdays(initial)
             box = ttk.Frame(self)
             box.grid(row=row, column=1, sticky="w", padx=8, pady=4)
-            for i, text in enumerate("一二三四五"):
+            # 舊設定可能選過六／日(本來就不生效):照樣列出,沒動就原樣保留
+            for i in sorted({0, 1, 2, 3, 4, *chosen}):
                 self._wd[i] = tk.BooleanVar(self, value=i in chosen)
-                ttk.Checkbutton(box, text=text, variable=self._wd[i]).pack(side="left")
+                ttk.Checkbutton(box, text="一二三四五六日"[i],
+                                variable=self._wd[i]).pack(side="left")
             row += 1
             ttk.Label(self, foreground="#666", justify="left", text=(
                 "勾一天：固定由此人值班。\n勾兩天以上：盡量由此人值班，點數平衡與其他"
@@ -116,6 +118,7 @@ class _MemberDialog(tk.Toplevel):
             out["level"] = self._level.get().strip()
         if self._wd is not None:
             days = [i for i, var in self._wd.items() if var.get()]
+            days = [i for i in days if i <= 4] or days
             out["fixed_weekday"] = days[0] if len(days) == 1 else None
             out["fixed_weekdays"] = days if len(days) > 1 else None
         self.result = out
@@ -481,6 +484,11 @@ class SettingsTab(ttk.Frame):
             # 只把【使用者真的改動過的】欄位疊上磁碟現值（見上方 before 的說明）。
             edits = {k: v for k, v in dlg.result.items()
                      if k != "id" and _field_changed(v, before.get(k))}
+            # ★值班星期的兩個鍵是【同一個】設定★(PR #29 審查):各自合併的話,他機
+            #   剛存的複選會留在本機改的單選旁邊,硬性固定就默默變成「盡量」。
+            wd_keys = ("fixed_weekday", "fixed_weekdays")
+            if any(k in edits for k in wd_keys):
+                edits.update({k: dlg.result[k] for k in wd_keys if k in dlg.result})
             updated = dict(members[j])
             updated.update(edits)
             updated["id"] = eff_id
