@@ -463,7 +463,7 @@ def _add_required_doctors_once(target: str, rows: list) -> tuple:
     # 全部改完再補缺的 —— 否則改掉的那個代號可能正是另一位的。
     for need in needs:
         same = [r for r in out if r.get("name") == need["name"]]
-        if same and all(str(r.get("doc_no")).upper() != need["doc_no"] for r in same):
+        if same and all(str(r.get("doc_no")).upper() != need["doc_no"] for r in out):
             same[0]["doc_no"] = need["doc_no"]
             changed = True
     for need in needs:
@@ -491,13 +491,15 @@ def load_doctors_settings(path: str | None = None) -> list:
         fixed = False
     if snapshot:
         return normalized
+    # 原檔是不是被正規化整個丟掉(要在補醫師【之前】判斷:補完可能剛好等於預設)
+    discarded = normalized == defaults and data != defaults
     mark, added = None, False
     if _st == "ok":
         normalized, added, mark = _add_required_doctors_once(target, normalized)
     if fixed or added:
         # [IE-11 2026-07-12] 若正規化結果退回預設(原檔形狀全錯被整個丟棄)且原檔確有異於預設的
         # 內容 → 覆寫前先備份成 .invalid-<ts>,免 OneDrive 還原的舊格式檔被靜默清空無法救回。
-        if normalized == defaults and data != defaults:
+        if discarded:
             try:
                 # [codex 2026-07-12] 備份名含 PID,避免同秒兩 process/session 產生同名 .invalid-<ts>
                 # 而第二個覆寫掉第一個的原檔備份;且不覆寫既有備份。

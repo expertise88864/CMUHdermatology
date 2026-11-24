@@ -100,3 +100,21 @@ def test_a_pre_transaction_backup_is_left_alone(tmp_path):
     p.write_text(raw, encoding="utf-8")                     # 姓名代號寫反的舊檔
     assert _codes(aps.load_doctors_settings(str(p))) == ["D00001"]
     assert p.read_text(encoding="utf-8") == raw             # 備份一個位元組都不動
+
+
+def test_a_code_already_owned_by_another_row_is_not_duplicated(tmp_path):
+    """[PR #30 審查] 代號已在別列(自訂顯示名)→ 不改同名那列,也不重複。"""
+    rows, _p = _load(tmp_path, [
+        {"name": "自訂名", "doc_no": "D34257", "notifications": False},
+        {"name": "蔡明洋", "doc_no": "D99999", "notifications": False}])
+    assert _codes(rows) == ["D34257", "D99999", "D35819"]
+
+
+def test_the_live_file_stays_when_the_corrected_list_equals_defaults(tmp_path, monkeypatch):
+    """[PR #30 審查] 改完剛好等於預設時,不可以先把原檔移走再寫失敗。"""
+    saved = [dict(d) for d in aps.DEFAULT_DOCTOR_SETTINGS]
+    next(d for d in saved if d["doc_no"] == "D34257")["doc_no"] = "D99999"
+    monkeypatch.setattr(aps, "atomic_write_json",
+                        lambda *a, **k: (_ for _ in ()).throw(PermissionError("鎖住")))
+    _rows, p = _load(tmp_path, saved)
+    assert json.loads(p.read_text(encoding="utf-8")) == saved
