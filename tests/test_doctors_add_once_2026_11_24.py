@@ -39,14 +39,29 @@ def test_only_the_missing_one_is_added(tmp_path):
     assert _codes(rows) == ["D35819", "D34257"] and rows[0]["notifications"] is True
 
 
-def test_same_name_with_another_code_is_not_duplicated(tmp_path):
-    rows, _p = _load(tmp_path, [{"name": "蔡明洋", "doc_no": "D99999", "notifications": False}])
-    assert [r["name"] for r in rows].count("蔡明洋") == 1
+def test_same_name_with_another_code_is_corrected_not_duplicated(tmp_path):
+    rows, _p = _load(tmp_path, [{"name": "蔡明洋", "doc_no": "D99999", "notifications": True}])
+    assert rows[0] == {"name": "蔡明洋", "doc_no": "D34257", "notifications": True}
+    assert sorted(_codes(rows)) == ["D34257", "D35819"]
 
 
 def test_fresh_install_already_has_both(tmp_path):
     rows, _p = _load(tmp_path)
     assert {"D34257", "D35819"} <= set(_codes(rows))
+    # [PR #30 審查] 第一次存檔就刪掉的,不可以再被加回來
+    rows, _p = _load(tmp_path, [r for r in rows if r["doc_no"] != "D34257"])
+    assert "D34257" not in _codes(rows)
+
+
+def test_a_denied_write_still_loads_and_retries_later(tmp_path, monkeypatch):
+    """[PR #30 審查] 補醫師寫不進檔不可以讓程式開不起來。"""
+    with monkeypatch.context() as m:
+        m.setattr(aps, "atomic_write_json",
+                  lambda *a, **k: (_ for _ in ()).throw(PermissionError("鎖住")))
+        rows, p = _load(tmp_path, [ROW])
+    assert len(rows) == 3 and json.loads(p.read_text(encoding="utf-8")) == [ROW]
+    assert len(aps.load_doctors_settings(str(p))) == 3
+    assert len(json.loads(p.read_text(encoding="utf-8"))) == 3
 
 
 def test_unreadable_file_is_neither_written_nor_marked(tmp_path, monkeypatch):
@@ -61,5 +76,7 @@ def test_unreadable_file_is_neither_written_nor_marked(tmp_path, monkeypatch):
 
 def test_a_pre_transaction_backup_is_left_alone(tmp_path):
     p = tmp_path / "doctors.json.rollback.bak"
-    p.write_text(json.dumps([ROW]), encoding="utf-8")
+    raw = json.dumps([{"name": "D00001", "doc_no": "測試甲", "notifications": True}])
+    p.write_text(raw, encoding="utf-8")                     # 姓名代號寫反的舊檔
     assert _codes(aps.load_doctors_settings(str(p))) == ["D00001"]
+    assert p.read_text(encoding="utf-8") == raw             # 備份一個位元組都不動

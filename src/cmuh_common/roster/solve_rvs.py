@@ -166,6 +166,10 @@ def _build_and_solve(ctx: SolveContext, scope: str, relaxed=frozenset()):
     solver = cp_model.CpSolver()
     solver.parameters.random_seed = _RANDOM_SEED
     solver.parameters.num_search_workers = 1
+    if scope == "vs":
+        # [2026-11-24] 8 位 VS 時預設設定常在時限內證不出最佳 → 點數明顯不平、
+        # 後面的週末輪替與星期順序也整段不跑;加強線性鬆弛後 1-2 秒就到最佳。
+        solver.parameters.linearization_level = 2
     solver.parameters.max_time_in_seconds = SOLVE_TIMEOUT_SEC
     status = solver.Solve(model)
     name = solver.StatusName(status)

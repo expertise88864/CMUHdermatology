@@ -457,12 +457,18 @@ def _add_required_doctors_once(target: str, rows: list) -> tuple:
     mark = os.path.join(os.path.dirname(target), _DOCTORS_ADD_ONCE_MARK)
     if os.path.basename(target) != "doctors.json" or os.path.exists(mark):
         return rows, False, None          # 已補過,或目前讀的是交易前備份
-    names = {str(r.get("name")) for r in rows}
-    codes = {str(r.get("doc_no")).upper() for r in rows}
-    added = [dict(d) for d in DEFAULT_DOCTOR_SETTINGS
-             if d["doc_no"] in _DOCTORS_ADD_ONCE
-             and d["doc_no"] not in codes and d["name"] not in names]
-    return rows + added, bool(added), mark
+    out, changed = [dict(r) for r in rows], False
+    for need in (d for d in DEFAULT_DOCTOR_SETTINGS if d["doc_no"] in _DOCTORS_ADD_ONCE):
+        if any(str(r.get("doc_no")).upper() == need["doc_no"] for r in out):
+            continue
+        # 同名但代號不同:查掛號用的是代號 → 改成指定代號,通知設定保留
+        same = next((r for r in out if r.get("name") == need["name"]), None)
+        if same is not None:
+            same["doc_no"] = need["doc_no"]
+        else:
+            out.append(dict(need))
+        changed = True
+    return out, changed, mark
 
 
 def load_doctors_settings(path: str | None = None) -> list:
@@ -478,10 +484,20 @@ def load_doctors_settings(path: str | None = None) -> list:
     if fixed and _st == "error":
         logging.error("doctors.json 暫時讀不到 → 跳過正規化寫回(避免把醫師清單覆蓋成預設)")
         fixed = False
-    mark = None
+    # 交易前備份是復原用的原檔,只讀不寫(清單照樣回傳整理過的)
+    if str(target).endswith(".rollback.bak"):
+        return normalized
+    mark, added = None, False
     if _st == "ok":
         normalized, added, mark = _add_required_doctors_once(target, normalized)
-        fixed = fixed or added
+    elif _st == "missing":          # 全新安裝:預設已含這兩位 → 直接算補過
+        _rows, _added, mark = _add_required_doctors_once(target, normalized)
+    if added and not fixed:
+        try:
+            atomic_write_json(target, normalized)
+        except OSError:             # 補不進檔不影響使用,下次啟動再試(不留記號)
+            logging.warning("[doctors] 補醫師寫檔失敗,下次再試", exc_info=True)
+            return normalized
     if fixed:
         # [IE-11 2026-07-12] 若正規化結果退回預設(原檔形狀全錯被整個丟棄)且原檔確有異於預設的
         # 內容 → 覆寫前先備份成 .invalid-<ts>,免 OneDrive 還原的舊格式檔被靜默清空無法救回。
