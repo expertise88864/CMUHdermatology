@@ -124,8 +124,9 @@ def test_planning_a_future_month_includes_new_members():
                        weekend_expected=dict.fromkeys(NOW, 0.0)).prepare()
     sats = {b.saturday: OLD[i % 5] for i, b in enumerate(ctx.blocks) if b.saturday}
     for duty in ({}, {date(2026, 12, 1): "D"}, sats):       # 週末全排給舊成員也一樣
-        rows = {r["id"]: r for r in ws.year_summary(ctx, duty, today=date(2026, 11, 24))}
-        assert rows["T"]["to_date"] == 0.6
+        for today in (date(2026, 11, 30), date(2026, 12, 1)):  # 進入當月也不變
+            rows = {r["id"]: r for r in ws.year_summary(ctx, duty, today=today)}
+            assert rows["T"]["to_date"] == 0.6
 
 
 def test_small_target_differences_survive_the_integer_costs():
