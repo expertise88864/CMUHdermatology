@@ -593,10 +593,11 @@ class RosterService:
                 if round(float(v or 0.0), 4) != 0.0}
 
     @staticmethod
-    def weekend_year_summary(ctx: SolveContext, duty_this_month: dict) -> list:
+    def weekend_year_summary(ctx: SolveContext, duty_this_month: dict,
+                             finalized: bool = False) -> list:
         """年度週末統計（見 weekend_share.year_summary；畫面與報告同一份）。"""
         from cmuh_common.roster.weekend_share import year_summary  # noqa: PLC0415
-        return year_summary(ctx, duty_this_month)
+        return year_summary(ctx, duty_this_month, finalized=finalized)
 
     @staticmethod
     def _weekend_prior(st, ym: str, members, holidays, exempt,

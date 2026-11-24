@@ -370,7 +370,8 @@ class CalendarDutyTab(ttk.Frame):
         from cmuh_common.roster.weekend_share import duty_map
         tree.delete(*tree.get_children())
         try:
-            rows = self.service.weekend_year_summary(ctx, duty_map(month, ctx.scope))
+            rows = self.service.weekend_year_summary(
+                ctx, duty_map(month, ctx.scope), bool(month.get("finalized")))
         except Exception:  # noqa: BLE001 —— 顯示失敗不可擋住整個分頁
             logging.exception("[roster.ui] 年度週末統計失敗（略過）")
             rows = []

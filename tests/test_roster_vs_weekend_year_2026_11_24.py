@@ -129,6 +129,19 @@ def test_planning_a_future_month_includes_new_members():
             assert rows["T"]["to_date"] == 0.6
 
 
+@pytest.mark.parametrize("n", [23, 24, 31])
+def test_unfinalized_future_draft_matches_the_solver_targets(n):
+    """[PR #31 審查] 未定案的未來月份不因填了幾格而改變;定案後只算當月在輪的人。"""
+    ctx = SolveContext("vs", 2026, 12, members=[Member(p, p) for p in NOW],
+                       weekend_expected=dict.fromkeys(NOW, 0.0)).prepare()
+    duty = {d: OLD[i % 5] for i, d in enumerate(ctx.days[:n])}
+    today = date(2026, 11, 24)
+    want = {p: round(t, 1) for p, t in ws.vs_targets(ctx, 4).items()}
+    assert {r["id"]: r["to_date"] for r in ws.year_summary(ctx, duty, today)} == want
+    done = {r["id"]: r for r in ws.year_summary(ctx, duty, today, finalized=True)}
+    assert done["T"]["to_date"] == 0 and done["D"]["to_date"] == 0.8
+
+
 def test_small_target_differences_survive_the_integer_costs():
     """[PR #31 審查] 目標差 0.029 次也要分得出先後(取到小數一位會變同分)。"""
     from cmuh_common.roster.vs_preferences import _cumulative_deviation
