@@ -119,12 +119,26 @@ def test_member_parsing(raw, single, multi):
 
 
 # ── 設定頁(真的 Tk)─────────────────────────────────────────────────────
+def _click(dlg, i):
+    """真的按畫面上的勾選框(不是直接改變數)。"""
+    def walk(w):
+        for c in w.winfo_children():
+            if c.winfo_class() == "TCheckbutton" and c.cget("text") == "一二三四五六日"[i]:
+                c.invoke()
+            walk(c)
+    walk(dlg)
+
+
+shown: list = []
+
+
 def _dialog(tk_root, monkeypatch, initial, toggles):
     from cmuh_common.roster.ui import settings as st
 
     def drive(dlg, _win=None):
         for i in toggles:
-            dlg._wd[i].set(not dlg._wd[i].get())
+            _click(dlg, i)
+        shown.append([k for k, var in dlg._wd.items() if var.get()])
         dlg._ok()
     monkeypatch.setattr(st._MemberDialog, "wait_window", drive)
     return st._MemberDialog(tk_root, "編輯", initial, True, True, id_locked=False).result
@@ -176,6 +190,7 @@ def test_past_days_are_not_prechecked():
 def test_a_legacy_weekend_choice_is_kept_until_changed(tk_root, monkeypatch, toggles, single):
     """[PR #29 審查] 舊設定選過週六:只改姓名不可以把它清掉;可以換掉或取消。"""
     out = _dialog(tk_root, monkeypatch, {"id": "A", "name": "甲", "fixed_weekday": 5}, toggles)
+    assert shown[-1] == ([] if single is None else [single])    # 看到的＝會存的
     assert (out["fixed_weekday"], out["fixed_weekdays"]) == (single, None)
 
 

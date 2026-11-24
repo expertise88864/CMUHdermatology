@@ -92,7 +92,8 @@ class _MemberDialog(tk.Toplevel):
             for i in sorted({0, 1, 2, 3, 4, *chosen}):
                 self._wd[i] = tk.BooleanVar(self, value=i in chosen)
                 ttk.Checkbutton(box, text="一二三四五六日"[i],
-                                variable=self._wd[i]).pack(side="left")
+                                variable=self._wd[i],
+                                command=lambda k=i: self._on_weekday(k)).pack(side="left")
             row += 1
             ttk.Label(self, foreground="#666", justify="left", text=(
                 "勾一天：固定由此人值班。\n勾兩天以上：盡量由此人值班，點數平衡與其他"
@@ -107,6 +108,13 @@ class _MemberDialog(tk.Toplevel):
         self.grab_set()
         self.wait_window(self)
 
+    def _on_weekday(self, i: int) -> None:
+        """平日與舊的六／日不並存:勾了一邊就取消另一邊,畫面與存檔一致。"""
+        if self._wd and self._wd[i].get():
+            for k, var in self._wd.items():
+                if (k > 4) != (i > 4):
+                    var.set(False)
+
     def _ok(self) -> None:
         mid = self._id.get().strip()
         name = self._name.get().strip()
@@ -118,7 +126,6 @@ class _MemberDialog(tk.Toplevel):
             out["level"] = self._level.get().strip()
         if self._wd is not None:
             days = [i for i, var in self._wd.items() if var.get()]
-            days = [i for i in days if i <= 4] or days
             out["fixed_weekday"] = days[0] if len(days) == 1 else None
             out["fixed_weekdays"] = days if len(days) > 1 else None
         self.result = out
