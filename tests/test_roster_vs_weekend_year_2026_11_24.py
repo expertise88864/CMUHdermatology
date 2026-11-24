@@ -110,12 +110,12 @@ def test_reopening_a_past_month_ignores_later_joiners(blank):
 
 @pytest.mark.parametrize("blank", [None, date(2026, 11, 25)])
 def test_adding_december_members_leaves_the_current_month_alone(blank):
-    """[PR #31 審查] 11/24 先把 12 月的人加進名單:11 月已排好的目標不變。"""
+    """[PR #31 審查] 11/24 先把 12 月的人加進名單:11 月已定案的目標不變。"""
     ctx = SolveContext("vs", 2026, 11, members=[Member(p, p) for p in NOW],
                        weekend_expected=dict.fromkeys(OLD, 2.8) | {"T": 0.0, "F": 0.0}
                        ).prepare()
     duty = {d: OLD[i % 5] for i, d in enumerate(ctx.days) if d != blank}
-    rows = {r["id"]: r for r in ws.year_summary(ctx, duty, today=date(2026, 11, 24))}
+    rows = {r["id"]: r for r in ws.year_summary(ctx, duty, date(2026, 11, 24), True)}
     assert rows["D"]["to_date"] == 3.6 and rows["T"]["to_date"] == 0
 
 
@@ -130,12 +130,12 @@ def test_planning_a_future_month_includes_new_members():
 
 
 @pytest.mark.parametrize("n", [23, 24, 31])
-def test_unfinalized_future_draft_matches_the_solver_targets(n):
-    """[PR #31 審查] 未定案的未來月份不因填了幾格而改變;定案後只算當月在輪的人。"""
+@pytest.mark.parametrize("today", [date(2026, 11, 30), date(2026, 12, 1)])
+def test_unfinalized_draft_matches_the_solver_targets(n, today):
+    """[PR #31 審查] 未定案的班表不因填了幾格、或進入當月而改變;定案後只算當月在輪的人。"""
     ctx = SolveContext("vs", 2026, 12, members=[Member(p, p) for p in NOW],
                        weekend_expected=dict.fromkeys(NOW, 0.0)).prepare()
     duty = {d: OLD[i % 5] for i, d in enumerate(ctx.days[:n])}
-    today = date(2026, 11, 24)
     want = {p: round(t, 1) for p, t in ws.vs_targets(ctx, 4).items()}
     assert {r["id"]: r["to_date"] for r in ws.year_summary(ctx, duty, today)} == want
     done = {r["id"]: r for r in ws.year_summary(ctx, duty, today, finalized=True)}

@@ -228,12 +228,9 @@ def year_summary(ctx, duty_this_month: dict, today: date | None = None,
         to_date = vs_targets(ctx, len(blocks))
         people = set(weights)
         working = set(duty_this_month.values())
-        today = today or date.today()
-        filled = sum(bool(duty_this_month.get(d)) for d in ctx.days)
-        if working and (finalized or ctx.days[-1] < today or (
-                ctx.days[0] <= today and 4 * filled >= 3 * len(ctx.days))):
-            # 已定案、已過去、或正在進行且大致排好(3/4 以上)的月份:只由那個月在輪的人
-            # 分,之後才加入的不算。還沒定案的未來月份 → 名單上的人一起分(與求解器相同)。
+        if working and (finalized or ctx.days[-1] < (today or date.today())):
+            # 已定案或已過去的月份:只由那個月在輪的人分,之後才加入的不算。
+            # 還沒定案的當月與未來月份 → 名單上的人一起分(與求解器相同)。
             people = working | {p for p, n in (ctx.weekend_expected or {}).items() if n > 0}
             to_date = {m.id: float((ctx.weekend_expected or {}).get(m.id, 0.0))
                        + (len(blocks) / len(people) if m.id in people else 0.0)
