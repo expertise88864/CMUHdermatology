@@ -329,6 +329,64 @@ class FixedWeekdayRule(Rule):
                     mc.model.Add(mc.x[(d, m.id)] == 1)
 
 
+def preferred_weekday_days(ctx, m, directives) -> list:
+    """複選值班星期中，這個月還排得到他的日子（規則、理由標籤與報告共用）。"""
+    return [d for d in ctx.days
+            if d.weekday() in m.fixed_weekdays
+            and d not in ctx.holidays          # 假日歸年度指定表管
+            and d not in directives            # 指定類優先
+            and not ctx.on_leave(m.id, d)      # 請假最優先
+            and (ctx.past_cutoff is None or d > ctx.past_cutoff)]
+
+
+@register_rule
+class PreferredWeekdaysRule(Rule):
+    scope = "r"
+    kind = "soft"
+    rule_id = "preferred_weekdays"
+    描述 = ("[2026-11-24 使用者] R 複選值班星期（兩天以上）盡量排同一人：所有硬規則與"
+          "點數平衡優先，先用指定星期湊點數，不足才排其他天")
+
+    # 權重:高於班數全距 1 單位(1,500)、週五連動(600)、3 連(500);一個整數點的點數
+    # 偏差是 1,000,000、拆 4 連/週末上限更高 → 這些都不會為了指定星期而犧牲。
+    # (帳本帶小數時點數偏差可能只差不到 0.1 點,那種近乎同分的情況會讓給指定星期。)
+    DAY_WEIGHT = 4000
+
+    def precheck(self, ctx):
+        checks = []
+        directives, _ = collect_directives(ctx)
+        for m in ctx.members:
+            for wd in m.fixed_weekdays:
+                for o in ctx.members:
+                    if o.id != m.id and o.fixed_weekday == wd:
+                        checks.append(Precheck(
+                            "warn", self.rule_id,
+                            f"週{'一二三四五'[wd]} 是 {o.name or o.id} 的固定值班日 → "
+                            f"{m.name or m.id} 這天的指定星期排不到"))
+            if not m.fixed_weekdays:
+                continue
+            for d in ctx.days:
+                if d.weekday() not in m.fixed_weekdays or d in ctx.holidays:
+                    continue
+                if ctx.on_leave(m.id, d):
+                    checks.append(Precheck(
+                        "info", self.rule_id,
+                        f"{d.month}/{d.day} 為 {m.name or m.id} 指定值班星期但已請假"
+                        f" → 由其他人代"))
+                elif d in directives and directives[d][0] != m.id:
+                    checks.append(Precheck(
+                        "info", self.rule_id,
+                        f"{d.month}/{d.day} 為 {m.name or m.id} 指定值班星期，但被"
+                        f"{directives[d][1]}給 {directives[d][0]}（指定優先）"))
+        return checks
+
+    def objective_terms(self, mc, ctx):
+        directives, _ = collect_directives(ctx)
+        return [(mc.x[(d, m.id)], -self.DAY_WEIGHT)
+                for m in ctx.members if m.fixed_weekdays
+                for d in preferred_weekday_days(ctx, m, directives)]
+
+
 @register_rule
 class ColorRule(Rule):
     rule_id = "weekend_color"

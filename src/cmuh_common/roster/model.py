@@ -31,26 +31,41 @@ SCHEMA_VERSION = 1
 # ─── 人員 ────────────────────────────────────────────────────────────────
 @dataclass
 class Member:
-    """R 或 VS 成員。fixed_weekday 僅 R 使用（0=週一…6=週日；None=無）。"""
+    """R 或 VS 成員。fixed_weekday 僅 R 使用（0=週一…6=週日；None=無）。
+
+    [2026-11-24 使用者] fixed_weekdays = 複選（兩天以上）的值班星期，【盡量】排他；
+    只選一天時仍用 fixed_weekday（硬性，行為不變），兩者不會同時有值。
+    存成另一個鍵：尚未更新的電腦讀到清單會壞在 int()，讀不懂新鍵則只是當作沒設。"""
     id: str
     name: str
     level: str = ""                      # R1/R2/R3；VS 留空
     fixed_weekday: Optional[int] = None
+    fixed_weekdays: tuple = ()
 
     @staticmethod
     def from_dict(d: dict) -> "Member":
         fw = d.get("fixed_weekday")
+        raw = d.get("fixed_weekdays")
+        multi = tuple(sorted({v for v in (raw if isinstance(raw, (list, tuple)) else ())
+                              if type(v) is int and 0 <= v <= 4}))
+        if len(multi) == 1:
+            fw, multi = multi[0], ()
+        elif multi:
+            fw = None
         return Member(
             id=str(d.get("id", "")),
             name=str(d.get("name", "")),
             level=str(d.get("level", "")),
             fixed_weekday=int(fw) if fw is not None else None,
+            fixed_weekdays=multi,
         )
 
     def to_dict(self) -> dict:
-        out = {"id": self.id, "name": self.name, "level": self.level}
+        out: dict = {"id": self.id, "name": self.name, "level": self.level}
         if self.fixed_weekday is not None:
             out["fixed_weekday"] = int(self.fixed_weekday)
+        if self.fixed_weekdays:
+            out["fixed_weekdays"] = list(self.fixed_weekdays)
         return out
 
 

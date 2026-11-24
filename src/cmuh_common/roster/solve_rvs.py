@@ -29,7 +29,8 @@ from cmuh_common.roster.model import (
     SolveContext, day_point, is_weekend,
 )
 from cmuh_common.roster.rules import (
-    RELAX_NAMES, RELAX_ORDER, collect_directives, rules_for, run_prechecks,
+    RELAX_NAMES, RELAX_ORDER, collect_directives, preferred_weekday_days,
+    rules_for, run_prechecks,
 )
 from cmuh_common.roster.weekend_share import counted_blocks, cumulative_targets
 
@@ -260,6 +261,8 @@ def _reasons_for(ctx: SolveContext, scope: str, assignments: dict) -> dict:
                     and d not in ctx.holidays and d not in directives
                     and not ctx.on_leave(m.id, d)):
                 fixed_days[d] = m.id
+    preferred = {(d, m.id) for m in ctx.members if m.fixed_weekdays
+                 for d in preferred_weekday_days(ctx, m, directives)}
     in_block = {d: b for b in ctx.blocks for d in b.days}
     out = {}
     for d, mid in assignments.items():
@@ -270,6 +273,8 @@ def _reasons_for(ctx: SolveContext, scope: str, assignments: dict) -> dict:
             out[d] = directives[d][1]
         elif scope == "r" and fixed_days.get(d) == mid:
             out[d] = "固定週幾"
+        elif scope == "r" and (d, mid) in preferred:
+            out[d] = "指定星期"
         elif d in in_block:
             out[d] = "假日成對"
         else:

@@ -11,6 +11,7 @@ from datetime import date
 from cmuh_common.roster.model import (SolveContext, day_point, is_weekend,
 )
 from cmuh_common.roster.ledger import fair_share
+from cmuh_common.roster.rules import collect_directives, preferred_weekday_days
 from cmuh_common.roster.weekend_share import year_summary
 
 _WD = "一二三四五六日"
@@ -97,6 +98,14 @@ def build_report(ctx: SolveContext, result, scope_label: str) -> str:
                 f"{pts:>6}"
                 f"{result.targets.get(m.id, 0):>8.2f}"
                 f"{new:>+9.2f}")
+        directives, _ = collect_directives(ctx)
+        for m in ctx.members:
+            days = preferred_weekday_days(ctx, m, directives)
+            if days and result.scope == "r":
+                got = sum(result.assignments.get(d) == m.id for d in days)
+                names = "、".join("一二三四五"[w] for w in m.fixed_weekdays)
+                lines.append(f"  {m.name or m.id} 指定星期（{names}）：可排 {len(days)} 天，"
+                             f"實排 {got} 天")
         if result.last_weekend:
             lines.append(f"  最後週末: {result.last_weekend['saturday']} → "
                          f"{result.last_weekend['person']}（供下月色塊/銜接）")

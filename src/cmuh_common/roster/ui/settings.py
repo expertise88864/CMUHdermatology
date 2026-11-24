@@ -25,13 +25,15 @@ from cmuh_common.roster.ui.training_settings import TrainingSettings
 _WD_CHOICES = ("無", "一", "二", "三", "四", "五", "六", "日")   # index-1 = weekday
 
 
-def _wd_to_text(wd) -> str:
-    return _WD_CHOICES[wd + 1] if isinstance(wd, int) and 0 <= wd <= 6 else "無"
-
-
-def _text_to_wd(text: str):
-    i = _WD_CHOICES.index(text) if text in _WD_CHOICES else 0
-    return None if i == 0 else i - 1
+def _member_weekdays(mem: dict) -> list:
+    """成員的值班星期(0=週一);與 `Member.from_dict` 同一套解讀,壞值當沒設。"""
+    raw = mem.get("fixed_weekdays")
+    days = sorted({v for v in (raw if isinstance(raw, list) else ())
+                   if type(v) is int and 0 <= v <= 4})
+    if days:
+        return days
+    one = mem.get("fixed_weekday")
+    return [one] if type(one) is int and 0 <= one <= 6 else []
 
 
 def _field_changed(new, old) -> bool:
@@ -41,7 +43,7 @@ def _field_changed(new, old) -> bool:
     沒有那個鍵 → 兩邊都視為「沒填」，不可算成一次變更（否則每次按確定都會塞
     `level: ""` 這種空欄位進去）。
     """
-    if new in ("", None) and old in ("", None):
+    if new in ("", None, []) and old in ("", None, []):
         return False
     return new != old
 
@@ -81,10 +83,19 @@ class _MemberDialog(tk.Toplevel):
         self._wd = None
         if with_wd:
             ttk.Label(self, text="固定值班").grid(row=row, column=0, sticky="e", **pad)
-            self._wd = ttk.Combobox(self, width=15, state="readonly",
-                                    values=_WD_CHOICES)
-            self._wd.set(_wd_to_text(initial.get("fixed_weekday")))
-            self._wd.grid(row=row, column=1, sticky="w", **pad)
+            # [2026-11-24 使用者] 可複選:一天＝固定(必排),兩天以上＝盡量排他
+            self._wd = {}
+            chosen = _member_weekdays(initial)
+            box = ttk.Frame(self)
+            box.grid(row=row, column=1, sticky="w", padx=8, pady=4)
+            for i, text in enumerate("一二三四五"):
+                self._wd[i] = tk.BooleanVar(self, value=i in chosen)
+                ttk.Checkbutton(box, text=text, variable=self._wd[i]).pack(side="left")
+            row += 1
+            ttk.Label(self, foreground="#666", justify="left", text=(
+                "勾一天：固定由此人值班。\n勾兩天以上：盡量由此人值班，點數平衡與其他"
+                "規則優先，\n點數不夠才安排其他天。")).grid(
+                    row=row, column=0, columnspan=2, sticky="w", padx=8, pady=4)
             row += 1
         btns = ttk.Frame(self)
         btns.grid(row=row, column=0, columnspan=2, pady=8)
@@ -100,11 +111,13 @@ class _MemberDialog(tk.Toplevel):
         if not mid:
             messagebox.showwarning("欄位不完整", "代號/ID 不可空白", parent=self)
             return
-        out = {"id": mid, "name": name}
+        out: dict = {"id": mid, "name": name}
         if self._level is not None:
             out["level"] = self._level.get().strip()
         if self._wd is not None:
-            out["fixed_weekday"] = _text_to_wd(self._wd.get())
+            days = [i for i, var in self._wd.items() if var.get()]
+            out["fixed_weekday"] = days[0] if len(days) == 1 else None
+            out["fixed_weekdays"] = days if len(days) > 1 else None
         self.result = out
         self.destroy()
 
@@ -362,7 +375,8 @@ class SettingsTab(ttk.Frame):
             if with_level:
                 vals.append(mem.get("level", ""))
             if with_wd:
-                vals.append(_wd_to_text(mem.get("fixed_weekday")))
+                vals.append("、".join("一二三四五六日"[i] for i in _member_weekdays(mem))
+                            or "無")
             tree.insert("", "end", iid=iid, values=vals)
 
     def _member_add(self, scope) -> None:
