@@ -97,7 +97,8 @@ class _MemberDialog(tk.Toplevel):
             row += 1
             ttk.Label(self, foreground="#666", justify="left", text=(
                 "勾一天：固定由此人值班。\n勾兩天以上：盡量由此人值班，點數平衡與其他"
-                "規則優先，\n點數不夠才安排其他天；可能連值 4、5 天，班數上限 12。")).grid(
+                "規則優先，\n點數不夠才安排其他天；可能連值 4、5 天，\n"
+                "班數上限至少放寬到 12（設定的上限更高則照設定）。")).grid(
                     row=row, column=0, columnspan=2, sticky="w", padx=8, pady=4)
             row += 1
         btns = ttk.Frame(self)

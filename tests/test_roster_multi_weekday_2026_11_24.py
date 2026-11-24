@@ -261,3 +261,11 @@ def test_one_five_day_run_costs_less_than_one_preferred_day():
     c = ConsecutiveDutyRule
     assert (3 * c.RUN3_WEIGHT + 2 * c.PREFERRED_RUN4_WEIGHT + c.PREFERRED_RUN5_WEIGHT
             < PreferredWeekdaysRule.DAY_WEIGHT)
+
+
+@pytest.mark.parametrize("configured, want", [(11, 12), (12, 12), (13, 13)])
+def test_the_cap_is_loosened_to_twelve_but_never_below_the_setting(configured, want):
+    from cmuh_common.roster.rules import DutyRangeRule
+    ctx = make_ctx(members=members())
+    ctx.params.duty_max = configured
+    assert [DutyRangeRule._max(ctx, m) for m in ctx.members] == [want, configured, configured]
