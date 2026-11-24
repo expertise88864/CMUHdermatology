@@ -111,7 +111,8 @@ def test_reopening_a_past_month_ignores_later_joiners(blank):
 def test_planning_a_future_month_includes_new_members():
     ctx = SolveContext("vs", 2026, 12, members=[Member(p, p) for p in NOW],
                        weekend_expected=dict.fromkeys(NOW, 0.0)).prepare()
-    for duty in ({}, {date(2026, 12, 1): "D"}):
+    sats = {b.saturday: OLD[i % 5] for i, b in enumerate(ctx.blocks) if b.saturday}
+    for duty in ({}, {date(2026, 12, 1): "D"}, sats):       # 週末全排給舊成員也一樣
         rows = {r["id"]: r for r in ws.year_summary(ctx, duty, today=date(2026, 11, 24))}
         assert rows["T"]["to_date"] == 0.6
 
