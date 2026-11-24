@@ -10,10 +10,11 @@ import pytest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 pytest.importorskip("ortools", reason="ortools 未安裝（自動排班引擎）")
 
-from cmuh_common.roster.model import Member  # noqa: E402
+from cmuh_common.roster.calendar_colors import week_colors_for_year  # noqa: E402
+from cmuh_common.roster.model import Member, SolveContext  # noqa: E402
 from cmuh_common.roster.report import build_report  # noqa: E402
 from cmuh_common.roster.rules import (  # noqa: E402
-    DutyCountBalanceRule, PreferredWeekdaysRule)
+    ConsecutiveDutyRule, DutyCountBalanceRule, PreferredWeekdaysRule)
 from cmuh_common.roster.solve_rvs import rvs_input_fingerprint, solve_duty  # noqa: E402
 from test_roster_solve import make_ctx  # noqa: E402
 
@@ -217,3 +218,46 @@ def test_a_concurrent_multi_choice_does_not_survive_beside_a_single_one(
     m = Member.from_dict(storage.load_config()["r_members"][0])
     assert (m.fixed_weekday, m.fixed_weekdays) == (0, ())
     tab.destroy()
+
+
+# ── [2026-11-24 使用者「選2」] 指定星期優先於避免連值 4、5 天;上限 12 ──────────
+def _december(off, weekdays=(2, 3)):
+    def D(n):
+        return date(2026, 12, n)
+    ctx = SolveContext(
+        "r", 2026, 12, holidays={D(25)}, annual_holiday={D(25): "K"},
+        members=[Member("K", "K", "R3", fixed_weekdays=weekdays),
+                 Member("C", "C", "R2", fixed_weekday=1),
+                 Member("Z", "Z", "R1", fixed_weekday=0)],
+        leaves={"K": {D(n) for n in off}, "C": {D(n) for n in (11, 12, 13)},
+                "Z": {D(n) for n in (19, 20, 26, 27)}},
+        ledger={"C": .33, "K": -.67, "Z": .33},
+        week_colors=week_colors_for_year(2026),
+        weekend_prior={"K": 6, "C": 6, "Z": 6},
+        weekend_weights={"K": 16.4, "C": 17.5, "Z": 19.1}).prepare()
+    res = solve_duty(ctx)
+    assert res.status == "ok"
+    return [d.day for d in sorted(res.assignments) if res.assignments[d] == "K"], res
+
+
+@pytest.mark.parametrize("off, want", [
+    ((31,), [2, 3, 9, 10, 16, 17, 23, 24, 30]),
+    ((2, 3, 31), [9, 10, 16, 17, 23, 24, 30])])
+def test_every_available_preferred_day_goes_to_them(off, want):
+    days, res = _december(off)
+    assert [n for n in days if date(2026, 12, n).weekday() in (2, 3)] == want
+    assert {25, 26, 27} <= set(days) and res.duty_counts["K"] <= 12
+    assert sum(abs(res.points_by_person[p] - res.targets[p]) for p in "KCZ") < 1.4
+    assert all(res.duty_counts[p] <= 11 for p in "CZ")
+
+
+def test_rules_are_unchanged_without_multiple_weekdays():
+    days, res = _december((31,), ())
+    assert res.duty_counts["K"] <= 11
+    assert not any(all(n + i in days for i in range(5)) for n in range(1, 28))
+
+
+def test_one_five_day_run_costs_less_than_one_preferred_day():
+    c = ConsecutiveDutyRule
+    assert (3 * c.RUN3_WEIGHT + 2 * c.PREFERRED_RUN4_WEIGHT + c.PREFERRED_RUN5_WEIGHT
+            < PreferredWeekdaysRule.DAY_WEIGHT)

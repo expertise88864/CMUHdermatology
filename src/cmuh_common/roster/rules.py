@@ -349,12 +349,14 @@ class PreferredWeekdaysRule(Rule):
     kind = "soft"
     rule_id = "preferred_weekdays"
     描述 = ("[2026-11-24 使用者] R 複選值班星期（兩天以上）盡量排同一人：所有硬規則與"
-          "點數平衡優先，先用指定星期湊點數，不足才排其他天")
+          "點數平衡優先，先用指定星期湊點數，不足才排其他天。"
+          "使用者選定：指定星期優先於避免連值 4、5 天")
 
-    # 權重:高於班數全距 1 單位(1,500)、週五連動(600)、3 連(500);一個整數點的點數
-    # 偏差是 1,000,000、拆 4 連/週末上限更高 → 這些都不會為了指定星期而犧牲。
+    # 權重:高於一整段 5 連的懲罰(見 ConsecutiveDutyRule 的 PREFERRED_*,合計 11,500)、
+    # 班數全距 1 單位(1,500)、週五連動(600);一個整數點的點數偏差是 1,000,000、週末
+    # 上限更高 → 這些不會為了指定星期而犧牲。
     # (帳本帶小數時點數偏差可能只差不到 0.1 點,那種近乎同分的情況會讓給指定星期。)
-    DAY_WEIGHT = 4000
+    DAY_WEIGHT = 20_000
 
     def precheck(self, ctx):
         checks = []
@@ -488,16 +490,25 @@ class DutyRangeRule(Rule):
     scope = "r"
     rule_id = "duty_range"
     描述 = ("每人每月班數範圍（預設 9-11）。[2026-10-19 使用者] 排不出來時不再"
-          "自動放寬，須使用者確認；點數差額照常進帳本、之後再還")
+          "自動放寬，須使用者確認；點數差額照常進帳本、之後再還。"
+          "[2026-11-24 使用者] 複選值班星期的人上限 12（連假輪值加上指定星期會超過 11）")
     relaxable = True
     needs_confirm = True
+
+    PREFERRED_MAX = 12
+
+    @classmethod
+    def _max(cls, ctx, m) -> int:
+        hi = ctx.params.duty_max
+        return max(hi, cls.PREFERRED_MAX) if m.fixed_weekdays else hi
 
     def precheck(self, ctx):
         n, days = len(ctx.members), len(ctx.days)
         if n <= 1:
             return [Precheck("warn", self.rule_id,
                              "只有 1 位成員 → 班數範圍規則自動停用")]
-        lo, hi = ctx.params.duty_min * n, ctx.params.duty_max * n
+        lo = ctx.params.duty_min * n
+        hi = sum(self._max(ctx, m) for m in ctx.members)
         if not (lo <= days <= hi):
             return [Precheck(
                 "warn", self.rule_id,
@@ -511,7 +522,7 @@ class DutyRangeRule(Rule):
         for m in ctx.members:
             n = sum(mc.x[(d, m.id)] for d in ctx.days)
             mc.model.Add(n >= ctx.params.duty_min)
-            mc.model.Add(n <= ctx.params.duty_max)
+            mc.model.Add(n <= self._max(ctx, m))
 
 
 @register_rule
@@ -653,6 +664,10 @@ class ConsecutiveDutyRule(Rule):
     RUN3_WEIGHT = 500
     RUN4_WEIGHT = 3_000_000
     RUN5_WEIGHT = 10_000_000
+    # [2026-11-24 使用者「選2」] R 有人複選值班星期時:指定星期優先於避免連值 4、5 天
+    # (一個 5 連 = 4,000+2×3,000+3×500 = 11,500 < DAY_WEIGHT)。VS 與沒人複選時不變。
+    PREFERRED_RUN4_WEIGHT = 3_000
+    PREFERRED_RUN5_WEIGHT = 4_000
 
     def _windows(self, ctx):
         """產生 (win_dates, length) —— 對「上月尾端＋本月」連續時間軸取 3/4/5 日窗，
@@ -680,6 +695,8 @@ class ConsecutiveDutyRule(Rule):
         if not ctx.days:
             return []
         weight = {3: self.RUN3_WEIGHT, 4: self.RUN4_WEIGHT, 5: self.RUN5_WEIGHT}
+        if ctx.scope == "r" and any(m.fixed_weekdays for m in ctx.members):
+            weight.update({4: self.PREFERRED_RUN4_WEIGHT, 5: self.PREFERRED_RUN5_WEIGHT})
         in_month = set(ctx.days)
         terms = []
         for m in ctx.members:
