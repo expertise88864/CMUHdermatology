@@ -63,7 +63,14 @@ def clamp_step(current: int, step: int, rng) -> int:
     return max(lo, min(hi, int(current) + step))
 
 
-def build_override(hc, existing, confirmed: dict):
+def program_ids(hc, major) -> dict:
+    """主程式在這個 HIS 版本會送出的編號(舊程式沒有分版本 → 內建那一組)。"""
+    if hasattr(hc, "menu_ids_for"):
+        return hc.menu_ids_for(major)
+    return {f["key"]: getattr(hc, f["key"]) for f in FUNCTIONS}
+
+
+def build_override(hc, existing, confirmed: dict, his_version=None):
     """組本機快速修正檔內容 → (data, error)。
 
     existing: 磁碟上現有的檔(可能為 None/壞掉/過期);confirmed: {MENU_ID_*: id}。
@@ -73,11 +80,16 @@ def build_override(hc, existing, confirmed: dict):
     以那份基線檔為準,override 的版本蓋不過它,勾了也照樣收改版通知(謊報成功)。
     改版通知要消掉,一律走主程式「設定」分頁的「重新校正」(寫的是真正的基線)。"""
     marker = hc.override_marker()
+    # [2026-11-25] 修正只屬於實測當下的 HIS 版本(換版後不可沿用);舊程式不認得這個鍵
+    bound = str(his_version) if his_version and hasattr(hc, "menu_ids_for") else ""
     data = {}
-    if isinstance(existing, dict) and existing.get("for_calibration") == marker:
+    if (isinstance(existing, dict) and existing.get("for_calibration") == marker
+            and existing.get("his_version", "") == bound):
         data = {k: v for k, v in existing.items()}
     data.update({k: int(v) for k, v in confirmed.items()})
     data["for_calibration"] = marker
+    if bound:
+        data["his_version"] = bound
     data["note"] = f"HIS熱鍵ID修正工具 實測 {datetime.date.today().isoformat()}"
     _updates, err = hc.parse_override(data, marker)
     return (data, "") if not err else ({}, err)
@@ -296,7 +308,15 @@ def main() -> int:  # noqa: C901 —— 單一視窗的版面,拆開反而難讀
                         foreground="#006400" if admin else "#B00020")
         hwnd, title = find_his_window()
         state["hwnd"] = hwnd
-        state["major"], state["full"] = parse_his_version(title)
+        major, full = parse_his_version(title)
+        # 讀不到版本(HIS 暫時關掉)→ 保留測試時的版本;換了版本 → 先前的實測作廢
+        changed = bool(major and state["major"] and major != state["major"])
+        if major:
+            state["major"], state["full"] = major, full
+        if changed:
+            state["confirmed"].clear()
+            refresh_summary()
+            on_func_change()
         st_his.config(text=("✔ 已找到 HIS「西醫門診醫師作業」視窗" if hwnd else
                             "✖ 找不到 HIS 視窗 → 請先打開「西醫門診醫師作業」並掛入一位病人，"
                             "再按「重新偵測」"),
@@ -307,8 +327,10 @@ def main() -> int:  # noqa: C901 —— 單一視窗的版面,拆開反而難讀
             st_prog.config(text=f"✖ 讀不到程式設定，無法寫入快速修正：{hc_err}",
                            foreground="#B00020")
         else:
-            st_prog.config(text=(f"程式目前使用（開啟本工具時）：代碼輸入＝{hc.MENU_ID_代碼輸入}、"
-                                 f"同意書＝{hc.MENU_ID_同意書}（校正版本 {hc.CALIBRATED_VERSION}）"),
+            ids = program_ids(hc, state["major"])
+            st_prog.config(text=("程式在這個 HIS 版本使用（開啟本工具時）："
+                                 f"代碼輸入＝{ids['MENU_ID_代碼輸入']}、"
+                                 f"同意書＝{ids['MENU_ID_同意書']}"),
                            foreground="#000000")
         st_ovr.config(**override_status(hc, read_override(hc)))
         test_btn.config(state="normal" if (admin and hwnd) else "disabled")
@@ -362,7 +384,8 @@ def main() -> int:  # noqa: C901 —— 單一視窗的版面,拆開反而難讀
 
     def on_func_change():
         f = current_func()
-        start = getattr(hc, f["key"], f["range"][0]) if hc is not None else f["range"][0]
+        start = (program_ids(hc, state["major"])[f["key"]] if hc is not None
+                 else f["range"][0])
         cand_var.set(clamp_step(start, 0, f["range"]))
         success_lbl.config(text=f"正確的畫面：{f['success']}")
         last_sent.update(key=None, id=None)
@@ -387,6 +410,7 @@ def main() -> int:  # noqa: C901 —— 單一視窗的版面,拆開反而難讀
         sent_var.set(f"已送出編號 {cid} → 請看 HIS 畫面是不是「{current_func()['success']}」")
 
     def confirm_current():
+        refresh_status()      # HIS 換了版本 → 清掉先前的實測
         if last_sent["key"] != current_func()["key"] or last_sent["id"] != cand_var.get():
             messagebox.showwarning("請先送出測試", "請先按「送出測試」並確認 HIS 畫面正確。")
             return
@@ -418,10 +442,12 @@ def main() -> int:  # noqa: C901 —— 單一視窗的版面,拆開反而難讀
         if hc is None:
             messagebox.showerror("無法寫入", f"讀不到程式設定：{hc_err}")
             return
+        refresh_status()      # HIS 換了版本 → 清掉先前的實測
         if not state["confirmed"]:
             messagebox.showwarning("沒有要寫的內容", "請先在步驟 3 確認至少一個功能的正確編號。")
             return
-        data, err = build_override(hc, read_override(hc), state["confirmed"])
+        data, err = build_override(hc, read_override(hc), state["confirmed"],
+                                   state["major"])
         if err:
             apply_var.set(f"❌ 沒寫入：{err}")
             return
@@ -468,9 +494,9 @@ def main() -> int:  # noqa: C901 —— 單一視窗的版面,拆開反而難讀
     ttk.Label(s4, textvariable=apply_var, wraplength=800, font=(F, 10, "bold"),
               foreground="#004080", justify="left").pack(anchor="w", padx=8, pady=4)
 
+    refresh_status()      # 先偵測 HIS 版本,起始編號才會是這個版本的
     on_func_change()
     refresh_summary()
-    refresh_status()
     root.mainloop()
     return 0
 

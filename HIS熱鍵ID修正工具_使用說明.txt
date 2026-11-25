@@ -124,12 +124,13 @@ Q7. 雙擊「修正HIS熱鍵ID.cmd」出現黑色視窗寫 Python not found？
 七、給維護者的技術備註
 ──────────────────────
   ‧ 修正寫在 settings\his_menu_override.json（只有這台電腦生效）。
+    修正綁定測試當下的 HIS 版本(his_version)，HIS 換版後不會沿用。
     本工具只寫 MENU_ID_代碼輸入、MENU_ID_同意書（主程式另接受
     MENU_ID_FINISH_NO_PRINT、CALIBRATED_VERSION）；其他鍵或數值不合理 →
     主程式整檔拒用。改版偵測的基線不在這個檔，由主程式「重新校正」寫入。
   ‧ 檔裡的 for_calibration 戳記對應程式內建的校正版本；正式校正
     （src\cmuh_common\his_contract.py 新增一筆 CALIBRATION_HISTORY）推版後
     戳記就不再相符，快速修正自動失效。
-  ‧ 正式修改請改 src\cmuh_common\his_contract.py 的 MENU_ID_* 與
+  ‧ 正式修改請改 src\cmuh_common\his_contract.py 的 MENU_IDS_BY_VERSION、MENU_ID_* 與
     CALIBRATED_VERSION，並在 CALIBRATION_HISTORY 最前面加一筆實測證據。
   ‧ 也可以手動執行：python HIS熱鍵ID修正工具.py（需系統管理員權限）。

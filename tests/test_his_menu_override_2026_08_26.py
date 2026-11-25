@@ -47,7 +47,8 @@ def test_a_corrected_calibration_expires_overrides_written_before_the_correction
     只能一列),筆數不變。更正前寫下、帶舊標記的 override(含 277)必須失效,
     不可以把更正蓋回去 —— 送 277 會打到會印繳費單的完成。"""
     newest = hc.CALIBRATION_HISTORY[0]
-    assert MARK == f"{hc.CALIBRATED_VERSION}#{len(hc.CALIBRATION_HISTORY)}#{newest.date}"
+    assert MARK.startswith(
+        f"{hc.CALIBRATED_VERSION}#{len(hc.CALIBRATION_HISTORY)}#{newest.date}#")
     before_fix = f"{hc.CALIBRATED_VERSION}#{len(hc.CALIBRATION_HISTORY)}"  # 舊格式標記
     try:
         _write({"for_calibration": before_fix, "MENU_ID_FINISH_NO_PRINT": 277})

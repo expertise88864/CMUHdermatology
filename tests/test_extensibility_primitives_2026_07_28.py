@@ -56,9 +56,10 @@ def test_main_aliases_point_at_the_single_source():
     """main.py 只能是別名 —— 若又有一份自己的字面值,兩邊就會漂移。"""
     import main
     assert main._HIS_CALIBRATED_VERSION == hc.CALIBRATED_VERSION
-    for name in ("MENU_ID_代碼輸入", "MENU_ID_FINISH_NO_PRINT", "MENU_ID_同意書",
-                 "MENU_ID_類別字首", "MENU_ID_代碼字首", "MENU_ID_名稱輸入"):
-        assert getattr(main, name) == getattr(hc, name), name
+    # [2026-11-25] 選單 id 依 HIS 版本取用 → main 不可再有固定值的別名
+    assert not [n for n in vars(main) if n.startswith("MENU_ID_")]
+    for name, value in hc.MENU_IDS_BY_VERSION[hc.CALIBRATED_VERSION].items():
+        assert getattr(hc, name) == value, name
 
 
 def test_menu_ids_are_declared_literally_in_one_place():

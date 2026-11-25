@@ -12,7 +12,9 @@
   1. 使用者實機確認熱鍵是否正常。
   2. 只改本檔:`CALIBRATED_VERSION` 換成新版本,若某個功能壞掉就同時改對應的
      `MENU_ID_*`,並在 `CALIBRATION_HISTORY` 加一列(**寫下憑據**:是誰、怎麼確認的)。
-  `main.py` 以同名 import 沿用,測試一律讀本模組而**不得**再硬編碼版本字串
+  ★[2026-11-25 使用者] 各台電腦的 HIS 版本可能不同★:院方版本與 id 要同時登記在
+  `MENU_IDS_BY_VERSION`(上面的字面值 = CALIBRATED_VERSION 那一列),已登記的版本
+  不要刪。`main.py` 送命令前讀 HIS 標題的版本、用 `menu_ids_for` 取 id;測試一律讀本模組而**不得**再硬編碼版本字串
   (有守門測試釘住)。
 
 【為什麼「憑據」是規約的一部分】
@@ -23,6 +25,7 @@
 """
 from __future__ import annotations
 
+import zlib
 from dataclasses import dataclass
 
 # ── 目前校正對應的 HIS 版本 ────────────────────────────────────────────────
@@ -42,6 +45,35 @@ MENU_ID_名稱輸入 = 221       # 未使用,同上(1151020 推定,未實測)
 MENU_ID_FINISH_NO_PRINT = 278
 # 手術及治療 > 開立電子同意書(F9/F10)
 MENU_ID_同意書 = 672
+
+# 各 HIS 版本實際送出的 id。只登記有憑據(見 CALIBRATION_HISTORY)的版本;
+# 退版/各機版本不同時,每一台依自己 HIS 標題的版本取用。
+MENU_IDS_BY_VERSION: dict = {
+    "1151020": {"MENU_ID_代碼輸入": 220, "MENU_ID_同意書": 672,
+                "MENU_ID_FINISH_NO_PRINT": 278},
+    "1151103": {"MENU_ID_代碼輸入": 220, "MENU_ID_同意書": 672,
+                "MENU_ID_FINISH_NO_PRINT": 278},
+    "1151117": {"MENU_ID_代碼輸入": 221, "MENU_ID_同意書": 673,
+                "MENU_ID_FINISH_NO_PRINT": 279},
+}
+
+
+def menu_ids_for(version) -> dict:
+    """HIS 主版本 → {MENU_ID_*: id}(含本機快速修正)。純查表,不碰 HIS。
+
+    沒登記的新版本 → 沿用比它舊的版本中最近的一個(改版通常接著前一版走;
+    照樣會被判為改版而通知);讀不到版本、或比所有登記版本都舊 → CALIBRATED_VERSION。
+    """
+    ver = str(version or "")
+    base = ver
+    if ver not in MENU_IDS_BY_VERSION:
+        older = [v for v in MENU_IDS_BY_VERSION
+                 if ver.isdigit() and int(v) < int(ver)]
+        base = max(older, key=int) if older else _LITERAL_CALIBRATED_VERSION
+    ids = dict(MENU_IDS_BY_VERSION[base])
+    if not _OVERRIDE_HIS_VERSION or _OVERRIDE_HIS_VERSION == ver:
+        ids.update(_OVERRIDE_IDS)
+    return ids
 
 
 @dataclass(frozen=True)
@@ -187,6 +219,8 @@ _OVERRIDABLE_MENU_IDS = ("MENU_ID_代碼輸入", "MENU_ID_同意書",
 _LITERAL_CALIBRATED_VERSION = CALIBRATED_VERSION
 OVERRIDE_NOTE = ""      # 非空 = override 生效中(內容=改了什麼)
 OVERRIDE_ERROR = ""     # 非空 = 有 override 檔但整檔被拒用(原因)
+_OVERRIDE_IDS: dict = {}      # 生效中的 override id
+_OVERRIDE_HIS_VERSION = ""    # override 綁定的 HIS 主版本;空 = 不分版本(手寫檔)
 _VERSION_OVERRIDDEN = False   # override 有沒有改到 CALIBRATED_VERSION(供 current_calibration 回退判斷)
 
 
@@ -204,11 +238,15 @@ def override_marker() -> str:
     —— 只看「版本+筆數」的話,更正前寫下的 override 會繼續有效,把更正蓋回去。
     更正最新一列時一律改它的 date,標記就跟著變。
 
+    末段是 MENU_IDS_BY_VERSION 的指紋:更正【非最新】版本的 id 時也要過期。
+
     任何正式校正(含只動尾碼/只 rebaseline 的)都會在 CALIBRATION_HISTORY 插一列
     → 筆數必然遞增 → 舊 override 必然過期。probe 寫檔時呼叫本函式取當下標記。
     """
     newest = CALIBRATION_HISTORY[0].date if CALIBRATION_HISTORY else ""
-    return f"{_LITERAL_CALIBRATED_VERSION}#{len(CALIBRATION_HISTORY)}#{newest}"
+    table = zlib.crc32(repr(sorted(MENU_IDS_BY_VERSION.items())).encode("utf-8"))
+    return (f"{_LITERAL_CALIBRATED_VERSION}#{len(CALIBRATION_HISTORY)}#{newest}"
+            f"#{table:08x}")
 
 
 def parse_override(data, marker: str):
@@ -220,7 +258,7 @@ def parse_override(data, marker: str):
     if not isinstance(data, dict):
         return {}, "override 內容不是 JSON 物件"
     allowed = set(_OVERRIDABLE_MENU_IDS) | {
-        "for_calibration", "CALIBRATED_VERSION", "note"}
+        "for_calibration", "CALIBRATED_VERSION", "note", "his_version"}
     unknown = sorted(set(map(str, data)) - allowed)
     if unknown:
         return {}, f"override 含未知鍵 {unknown} → 整檔拒用"
@@ -231,6 +269,9 @@ def parse_override(data, marker: str):
     note = data.get("note", "")
     if not isinstance(note, str) or len(note) > 200:
         return {}, "override 的 note 必須是 ≤200 字的字串"
+    hv = data.get("his_version", "")
+    if not isinstance(hv, str) or (hv and not (hv.isdigit() and 6 <= len(hv) <= 8)):
+        return {}, f"override 的 his_version={hv!r} 不是 6-8 位數字字串 → 整檔拒用"
     updates = {}
     for key in _OVERRIDABLE_MENU_IDS:
         if key not in data:
@@ -254,6 +295,7 @@ def _apply_local_override() -> None:
     """載入期套用本機快速修正(有就套、沒有就安靜)。**絕不丟例外**——
     六支程式共用本模組,一個壞掉的 settings 不可以讓它們一起起不來。"""
     global OVERRIDE_NOTE, OVERRIDE_ERROR, _VERSION_OVERRIDDEN
+    global _OVERRIDE_IDS, _OVERRIDE_HIS_VERSION
     import json  # noqa: PLC0415
     try:
         try:
@@ -269,9 +311,18 @@ def _apply_local_override() -> None:
         if err:
             OVERRIDE_ERROR = f"本機快速修正檔:{err}"
             return
+        bound = data.get("his_version", "")
+        before = menu_ids_for(bound)
+        _OVERRIDE_IDS = {k: v for k, v in updates.items() if k in _OVERRIDABLE_MENU_IDS}
+        _OVERRIDE_HIS_VERSION = bound
         changed = []
         for key, v in updates.items():
-            old = globals()[key]
+            old = before.get(key, globals()[key])
+            # 綁定別的 HIS 版本的 id 不可以動到預設值(那是 CALIBRATED_VERSION 的)
+            if key in _OVERRIDE_IDS and bound not in ("", _LITERAL_CALIBRATED_VERSION):
+                if old != v:
+                    changed.append(f"{key} {old}→{v}")
+                continue
             if old != v:
                 globals()[key] = v
                 changed.append(f"{key} {old}→{v}")
@@ -279,6 +330,7 @@ def _apply_local_override() -> None:
                     _VERSION_OVERRIDDEN = True
         if changed:
             OVERRIDE_NOTE = ("本機快速修正生效:" + "、".join(changed)
+                             + (f"(只用於 HIS V.{bound})" if bound else "")
                              + f"(settings/{OVERRIDE_FILENAME};正式校正推版後"
                                "會自動失效)")
         else:

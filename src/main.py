@@ -2369,8 +2369,9 @@ def _his_write_baseline_fp() -> dict:
     有人再按一次按鈕,不按就一直收改版通知。`CALIBRATION_HISTORY` 是團隊級的
     驗證紀錄,比某台機器七月按下的那一次晚,就該接手。
 
-    ★這不會讓落後的機器變得比較安全,而是相反★:選單 id 只有一組(對應
-    `CALIBRATED_VERSION`)。一台 HIS 仍停在舊版的機器,原本因為「基線=現況」
+    (2026-11-25 起選單 id 依 HIS 版本取用;已登記的版本見 `_his_write_verdict_for`,
+    下面這段只剩【沒登記】的版本適用。)
+    ★這不會讓落後的機器變得比較安全,而是相反★:沒登記的版本沒有專屬 id。一台 HIS 仍停在舊版的機器,原本因為「基線=現況」
     而靜悄悄地用新版 id 去按舊版選單;接手之後那台會被判為改版而通知 ——
     這正是它本來就該收到的警告。而使用者若在該機實測後按「重新校正」,
     那次校正比程式碼晚 → 立刻蓋回機器的基線,按鈕仍然真的有效。
@@ -2404,8 +2405,15 @@ def sample_his_current_fp(title: str):
 
 def _his_write_verdict_for(title: str):
     """純函式:給 title 算 HIS 寫入契約裁決(現況 vs 基線)。gate/顯示/校正共用,無副作用。"""
-    return _canary_compare(_CANARY_HIS_SURFACE, _his_write_baseline_fp(),
-                           sample_his_current_fp(title))
+    current = sample_his_current_fp(title)
+    baseline = _his_write_baseline_fp()
+    # [2026-11-25 使用者] 已登記 id 的版本(各機可能不同)都算已校正,不是改版。
+    # 主版本與基線相同時仍照基線比對(保留「重新校正」的尾碼敏感度)。
+    ver = (current or {}).get("title_version")
+    if (ver in _HIS_CONTRACT.MENU_IDS_BY_VERSION
+            and ver != baseline.get("title_version")):
+        baseline = {"title_version": ver}
+    return _canary_compare(_CANARY_HIS_SURFACE, baseline, current)
 
 
 # [使用者定案 2026-07-20] 金絲雀改版偵測、稽核健康/回讀不符等「開發者維護訊息」只寄給
@@ -2692,11 +2700,17 @@ def _sample_his_write_contract(title: str) -> None:
         _notify_his_drift(v)
     # ACTION_BLOCK:NOTIFY_ONLY 政策下不會走到;未來改擋寫入政策時在此加擋下訊號。
 
-# 醫令 子選單 command ID —— 值在 cmuh_common.his_contract(單一宣告處),此處為別名。
-MENU_ID_類別字首 = _HIS_CONTRACT.MENU_ID_類別字首
-MENU_ID_代碼字首 = _HIS_CONTRACT.MENU_ID_代碼字首
-MENU_ID_代碼輸入 = _HIS_CONTRACT.MENU_ID_代碼輸入     # F1~F5 都走這個
-MENU_ID_名稱輸入 = _HIS_CONTRACT.MENU_ID_名稱輸入
+
+def _his_menu_id(name: str, main_hwnd: int) -> int:
+    """這個 HIS 視窗要送的選單 id(F1~F5 代碼輸入、F9/F10 同意書、F11 完成不印)。
+
+    [2026-11-25 使用者] 各台電腦的 HIS 版本可能不同 → 依標題版本查 his_contract。
+    標題這次讀不到 → 用剛才找視窗時的版本快照;都沒有 → 預設版本。"""
+    title = _his_title_of(main_hwnd)
+    ver = _his_title_version(title or f"V.{_his_last_sample[0]}")
+    menu_id = _HIS_CONTRACT.menu_ids_for(ver)[name]
+    logging.info("[his-contract] HIS 版本 %s → %s=%s", ver or "(讀不到)", name, menu_id)
+    return menu_id
 
 
 def _find_hospital_main_window() -> int:
@@ -2888,7 +2902,8 @@ def _script_code_input_adaptive(code: str, label: str = "",
     # 控制項對 IME 狀態敏感）
     _force_ime_english(hwnd)
     previous_focus = _get_thread_focus(hwnd)
-    if not _send_yiling_menu_command(hwnd, MENU_ID_代碼輸入):
+    menu_id = _his_menu_id("MENU_ID_代碼輸入", hwnd)
+    if not _send_yiling_menu_command(hwnd, menu_id):
         logging.warning("[%s] 代碼輸入 menu command 送出失敗", label)
         # [2026-07-26 審查] 同上:連選單命令都送不出去時,醫師更需要知道「什麼都沒發生」。
         if warn_on_silent_failure:
@@ -2929,7 +2944,7 @@ def _script_code_input_adaptive(code: str, label: str = "",
             # 產生錯誤安全感。
             _record_his_action(
                 _LEDGER_HIS_MENU, f"{label or '代碼輸入'} 醫令代碼", main_hwnd=hwnd,
-                target=f"menu:{MENU_ID_代碼輸入}", value=_EvCode("醫令代碼", code),
+                target=f"menu:{menu_id}", value=_EvCode("醫令代碼", code),
                 outcome=_LEDGER_SUBMITTED if (chars_ok and enter_ok)
                         else _LEDGER_FAILED,
                 detail=_EvReason("no_readback") if (chars_ok and enter_ok)
@@ -2945,7 +2960,7 @@ def _script_code_input_adaptive(code: str, label: str = "",
             # 關閉/強制重啟,這筆紀錄根本不會產生 —— 帳本契約是「動作發生的當下」。
             _record_his_action(
                 _LEDGER_HIS_MENU, f"{label or '代碼輸入'} 醫令代碼", main_hwnd=hwnd,
-                target=f"menu:{MENU_ID_代碼輸入}", value=_EvCode("醫令代碼", code),
+                target=f"menu:{menu_id}", value=_EvCode("醫令代碼", code),
                 outcome=_LEDGER_SKIPPED, detail=_EvReason("no_focus"))
             # [2026-07-26 審查] 醫師按了 F1-F5 卻【完全沒有東西發生】——舊版只寫 log,
             # 醫師會以為醫令已下(這條路徑正是 HIS 改版把選單 id 位移時會走到的)。
@@ -5751,11 +5766,6 @@ def _find_menu_command_id_by_text(main_hwnd: int, target_text: str) -> int:
         return 0
 
 
-# 完成 > 完成不印(F11 照光療程 2/3 用,避免印繳費單)。
-# 值與校正沿革在 cmuh_common.his_contract,此處為別名。
-MENU_ID_FINISH_NO_PRINT = _HIS_CONTRACT.MENU_ID_FINISH_NO_PRINT
-
-
 def _f11_normalize_course_value(raw_value: str) -> str:
     """[2026-08-01] 內容搬到 `cmuh_common.course_value.normalize_course_value`。
 
@@ -5890,19 +5900,20 @@ def _f11_send_finish_no_print(main_hwnd: int, course_value: str,
                               label: str, started_at: float) -> bool:
     """F11 route A: phototherapy course 2/3 -> 完成不印, then same popup flow."""
     dynamic_id = _find_menu_command_id_by_text(main_hwnd, "完成不印")
+    calibrated_id = _his_menu_id("MENU_ID_FINISH_NO_PRINT", main_hwnd)
     candidate_ids = []
     if dynamic_id:
         candidate_ids.append(dynamic_id)
-        if dynamic_id != MENU_ID_FINISH_NO_PRINT:
+        if dynamic_id != calibrated_id:
             logging.info("[%s] 完成不印動態 id=%s（既有備援 id=%s）",
-                         label, dynamic_id, MENU_ID_FINISH_NO_PRINT)
+                         label, dynamic_id, calibrated_id)
     else:
         # owner-draw 選單 GetMenuStringW 讀不到文字 → 按文字解析本就比不到「完成不印」,
-        # 屬預期;靠校正過的 MENU_ID_FINISH_NO_PRINT。降為 INFO 避免假警報(非真失敗)。
+        # 屬預期;靠該 HIS 版本校正過的 id。降為 INFO 避免假警報(非真失敗)。
         logging.info("[%s] 完成不印:owner-draw 選單無文字(預期),使用校正 id=%s",
-                     label, MENU_ID_FINISH_NO_PRINT)
-    if MENU_ID_FINISH_NO_PRINT not in candidate_ids:
-        candidate_ids.append(MENU_ID_FINISH_NO_PRINT)
+                     label, calibrated_id)
+    if calibrated_id not in candidate_ids:
+        candidate_ids.append(calibrated_id)
 
     for cmd_id in candidate_ids:
         if _send_yiling_menu_command(main_hwnd, cmd_id):
@@ -6709,9 +6720,7 @@ def script_F4_adaptive():
 #   5. 點「開立電子」TButton
 #   6+ 後續 popup 操作（Round 2 之後加）
 
-# 值與校正沿革在 cmuh_common.his_contract,此處為別名。
-MENU_ID_同意書 = _HIS_CONTRACT.MENU_ID_同意書
-
+# 選單 id 依 HIS 版本取用(見 _his_menu_id),沿革在 cmuh_common.his_contract。
 
     # [2026-05-25 v15 死碼清除] 移除舊 Python callback 路徑 (~50 行) — 上方
     # while True FindWindowExW loop 一定 return (hwnd or 0)，下面永遠到不了。
@@ -7765,10 +7774,11 @@ def script_F9_F10_consent_form_adaptive(form_code: str,
         logging.warning("[%s] 送出同意書命令前已存在 %d 個同意書視窗 %s → 一律排除,"
                         "只認新開的", label, len(_stale_ormain), _stale_ormain)
     # 用 Post (非同步) 避免 SendMessage 卡住 (實測 2026-05-18 12:43)
-    if not _send_yiling_menu_command(main_hwnd, MENU_ID_同意書):
+    menu_id = _his_menu_id("MENU_ID_同意書", main_hwnd)
+    if not _send_yiling_menu_command(main_hwnd, menu_id):
         logging.warning("[%s] 同意書 WM_COMMAND 送出失敗", label)
         return False
-    logging.info("[%s] 已觸發 其他→同意書 (id=%s, Post)", label, MENU_ID_同意書)
+    logging.info("[%s] 已觸發 其他→同意書 (id=%s, Post)", label, menu_id)
 
     # Step 2: 等 TOrMain 視窗出現
     # [穩定性] 25s timeout + 失敗 retry 1 次。實測 2026-05-19 11:47 醫院後端慢
@@ -7779,7 +7789,7 @@ def script_F9_F10_consent_form_adaptive(form_code: str,
                                  exclude_hwnds=_stale_ormain)
     if not or_hwnd:
         logging.warning("[%s] 等 TOrMain 25s 超時，重 Post WM_COMMAND 再試 1 次", label)
-        if not _send_yiling_menu_command(main_hwnd, MENU_ID_同意書):
+        if not _send_yiling_menu_command(main_hwnd, menu_id):
             logging.warning("[%s] 同意書 retry WM_COMMAND 送出失敗", label)
             return False
         or_hwnd = _wait_for_window("TOrMain", title_kw="同意書開立作業",
@@ -7791,7 +7801,7 @@ def script_F9_F10_consent_form_adaptive(form_code: str,
                 label)
             _record_his_action(
                 _LEDGER_HIS_MENU, f"{label} 同意書開啟", main_hwnd=main_hwnd,
-                target=f"menu:{MENU_ID_同意書}", value=_EvCode("同意書", form_code),
+                target=f"menu:{menu_id}", value=_EvCode("同意書", form_code),
                 outcome=_LEDGER_FAILED, detail=_EvReason("window_not_opened"))
             return False
         logging.info("[%s] 重試成功", label)
@@ -7799,7 +7809,7 @@ def script_F9_F10_consent_form_adaptive(form_code: str,
     # [稽核 2026-07-17] 同意書視窗真的開起來 = 選單 id 仍正確(隱含驗證)。記下開了哪種
     # 同意書(MO04 腫瘤手術 / MU02 切片)與當時 HIS 版本。
     _record_his_action(_LEDGER_HIS_MENU, f"{label} 同意書開啟", main_hwnd=main_hwnd,
-                       target=f"menu:{MENU_ID_同意書}",
+                       target=f"menu:{menu_id}",
                        value=_EvCode("同意書", form_code), outcome=_LEDGER_OK)
     # 不主動推到底層 — ForegroundProtector 會在使用者切走時才保護
     _sleep_interruptible(0.3)  # 等視窗 paint 完成
