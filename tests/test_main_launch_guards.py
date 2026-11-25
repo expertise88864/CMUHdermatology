@@ -862,13 +862,13 @@ def test_his_menu_id_calibration_2026_07_20():
     import sys
     sys.path.insert(0, str(ROOT / "src"))
     import main
-    assert main.MENU_ID_同意書 == 673, "F9/F10 同意書選單 id(1151117 隨醫令 +1)"
+    assert main.MENU_ID_同意書 == 672, "F9/F10 同意書選單 id(1151020 實測過)"
     # ★數值用字面值釘死★ 這是「打到別的選單 = 寫錯病歷」的防線,
     #   不可改成讀 his_contract —— 那會退化成 assert X == X。
-    assert main.MENU_ID_代碼輸入 == 221, "F1~F5 代碼輸入選單 id(1151117 使用者實測 221)"
-    assert main.MENU_ID_FINISH_NO_PRINT == 279, (
-        "F11 照光 2/3 完成不印(1151117 隨醫令 +1 為 279;前一個 id 是會印單的完成)")
-    assert main._HIS_CALIBRATED_VERSION == "1151117", "1151117 選單 id 整批 +1"
+    assert main.MENU_ID_代碼輸入 == 220, "F1~F5 代碼輸入選單 id(1151020 實測過 220)"
+    assert main.MENU_ID_FINISH_NO_PRINT == 278, (
+        "F11 照光 2/3 完成不印(1151020 為 278;前一個 id 是會印單的完成)")
+    assert main._HIS_CALIBRATED_VERSION == "1151020", "HIS 退回 1151020"
 
 
 def test_hotkey_waits_are_interruptible():
@@ -907,10 +907,10 @@ def test_f11_phototherapy_uses_finish_no_print_without_print_fallback():
     # 「實際生效的值」+「字面值確實宣告在那一支」——後者仍用字面值,不可退化成
     # assert X == X(打到別的選單 = 寫錯病歷,這是安全防線)。
     import main as _main
-    assert _main.MENU_ID_FINISH_NO_PRINT == 279
+    assert _main.MENU_ID_FINISH_NO_PRINT == 278
     _hc_src = (ROOT / "src" / "cmuh_common" / "his_contract.py").read_text(
         encoding="utf-8")
-    assert "MENU_ID_FINISH_NO_PRINT = 279" in _hc_src
+    assert "MENU_ID_FINISH_NO_PRINT = 278" in _hc_src
     # ★[2026-08-01 外部 review P1-03] 分流判準改成 typed，臨床行為不變★
     #   使用者定案：讀不到／讀到怪東西仍照舊按「全部完成」。判準搬進
     #   `CourseReadResult.is_phototherapy_2_or_3`（那裡才拿得到 status），

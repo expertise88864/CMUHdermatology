@@ -43,9 +43,13 @@ def test_missing_history_entry_fails_loudly(monkeypatch):
 
 
 def test_history_is_newest_first_and_unique():
-    versions = [c.version for c in hc.CALIBRATION_HISTORY]
-    assert len(versions) == len(set(versions)), "同一版本不該有兩筆"
-    assert versions == sorted(versions, reverse=True), "由新到舊"
+    # 院方會退版(2026-11-25:1151117 → 1151020),所以以校正日期排序、不以版本號
+    rows = [(c.version, c.date) for c in hc.CALIBRATION_HISTORY]
+    assert len(rows) == len(set(rows)), "同一版本同一天不該有兩筆"
+    assert all(a[0] != b[0] for a, b in zip(rows, rows[1:], strict=False)), "同版更正要改既有那一列"
+    dates = [d for _v, d in rows]
+    assert dates == sorted(dates, reverse=True), "由新到舊"
+    assert hc.current_calibration() is hc.CALIBRATION_HISTORY[0], "退版要取最新那一列"
 
 
 def test_main_aliases_point_at_the_single_source():
@@ -62,8 +66,8 @@ def test_menu_ids_are_declared_literally_in_one_place():
     src = open(os.path.join(os.path.dirname(__file__), '..', 'src',
                             'cmuh_common', 'his_contract.py'),
                encoding='utf-8').read()
-    for line in ("MENU_ID_代碼輸入 = 221", "MENU_ID_FINISH_NO_PRINT = 279",
-                 "MENU_ID_同意書 = 673", 'CALIBRATED_VERSION = "1151117"'):
+    for line in ("MENU_ID_代碼輸入 = 220", "MENU_ID_FINISH_NO_PRINT = 278",
+                 "MENU_ID_同意書 = 672", 'CALIBRATED_VERSION = "1151020"'):
         assert line in src, f"缺少字面宣告:{line}"
 
 
