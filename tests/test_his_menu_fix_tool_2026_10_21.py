@@ -52,6 +52,7 @@ class TestImportHasNoSideEffects:
 class TestHisVersion:
     @pytest.mark.parametrize("title, want", [
         ("西醫門診醫師作業 V.1151020.01", ("1151020", "1151020.01")),
+        ("西醫門診醫師作業 v.1151117.01", ("1151117", "1151117.01")),
         ("西醫門診醫師作業 V1150629", ("1150629", "1150629")),
         ("西醫門診醫師作業", (None, None)),
         ("", (None, None)),
@@ -90,7 +91,7 @@ class TestSafeRanges:
 
 class TestBuildOverride:
     def test_the_written_file_is_accepted_by_the_main_program(self, tool, clean_hc):
-        data, err = tool.build_override(hc, None, {"MENU_ID_代碼輸入": 221})
+        data, err = tool.build_override(hc, None, {"MENU_ID_代碼輸入": 221}, "1151020")
         assert err == ""
         assert data["for_calibration"] == hc.override_marker()
         tool.write_override(hc, data)
@@ -99,31 +100,32 @@ class TestBuildOverride:
         assert m.OVERRIDE_ERROR == "" and "MENU_ID_代碼輸入" in m.OVERRIDE_NOTE
 
     def test_a_current_file_is_merged(self, tool):
-        old = {"for_calibration": hc.override_marker(), "MENU_ID_同意書": 673}
-        data, err = tool.build_override(hc, old, {"MENU_ID_代碼輸入": 221})
+        old = {"for_calibration": hc.override_marker(), "MENU_ID_同意書": 673,
+               "his_version": "1151020"}
+        data, err = tool.build_override(hc, old, {"MENU_ID_代碼輸入": 221}, "1151020")
         assert err == "" and data["MENU_ID_同意書"] == 673 and data["MENU_ID_代碼輸入"] == 221
 
     def test_a_stale_file_is_not_revived(self, tool):
         """★過期檔的其他鍵是上一個校正時代的值★:合併後蓋上新戳記等於把舊值復活。"""
         stale = {"for_calibration": "1150629#3", "MENU_ID_同意書": 670}
-        data, err = tool.build_override(hc, stale, {"MENU_ID_代碼輸入": 221})
+        data, err = tool.build_override(hc, stale, {"MENU_ID_代碼輸入": 221}, "1151020")
         assert err == "" and "MENU_ID_同意書" not in data
 
     def test_the_tool_never_writes_the_calibrated_version(self, tool):
         """[外審 PR #10 第 1 輪] 按過「重新校正」的機器以基線檔為準,override 的
         CALIBRATED_VERSION 蓋不過它 → 工具不提供「記為校正版本」(會謊報成功),
         改版通知一律走主程式的「重新校正」。"""
-        data, err = tool.build_override(hc, None, {"MENU_ID_同意書": 673})
+        data, err = tool.build_override(hc, None, {"MENU_ID_同意書": 673}, "1151020")
         assert err == "" and "CALIBRATED_VERSION" not in data
         src = open(os.path.join(ROOT, TOOL_NAME), encoding="utf-8").read()
         assert '"CALIBRATED_VERSION"]' not in src and "重新校正" in src
 
     def test_nothing_to_write_is_rejected(self, tool):
-        data, err = tool.build_override(hc, None, {})
+        data, err = tool.build_override(hc, None, {}, "1151020")
         assert data == {} and err
 
     def test_a_bad_value_is_rejected_before_writing(self, tool):
-        data, err = tool.build_override(hc, None, {"MENU_ID_同意書": 0})
+        data, err = tool.build_override(hc, None, {"MENU_ID_同意書": 0}, "1151020")
         assert data == {} and "1..65535" in err
 
 

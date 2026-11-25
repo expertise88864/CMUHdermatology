@@ -50,7 +50,7 @@ FUNCTIONS = (
 # ─── 純函式（有測試）──────────────────────────────────────────────────────
 def parse_his_version(title: str):
     """HIS 標題 → (主版本, 完整版本)；讀不到回 (None, None)。例：V.1151020.01 → ("1151020","1151020.01")。"""
-    m = re.search(r"V\.?\s*(\d{6,8})(?:\.(\d+))?", title or "")
+    m = re.search(r"[Vv]\.?\s*(\d{6,8})(?:\.(\d+))?", title or "")
     if not m:
         return None, None
     major = m.group(1)
@@ -81,7 +81,11 @@ def build_override(hc, existing, confirmed: dict, his_version=None):
     改版通知要消掉,一律走主程式「設定」分頁的「重新校正」(寫的是真正的基線)。"""
     marker = hc.override_marker()
     # [2026-11-25] 修正只屬於實測當下的 HIS 版本(換版後不可沿用);舊程式不認得這個鍵
-    bound = str(his_version) if his_version and hasattr(hc, "menu_ids_for") else ""
+    bound = ""
+    if hasattr(hc, "menu_ids_for"):
+        if not his_version:
+            return {}, "讀不到 HIS 版本，無法判斷這個編號屬於哪一版"
+        bound = str(his_version)
     data = {}
     if (isinstance(existing, dict) and existing.get("for_calibration") == marker
             and existing.get("his_version", "") == bound):
@@ -298,7 +302,7 @@ def main() -> int:  # noqa: C901 —— 單一視窗的版面,拆開反而難讀
     st_ovr = label(s1, "")
     btns1 = ttk.Frame(s1)
     btns1.pack(anchor="w", padx=8, pady=4)
-    state = {"hwnd": 0, "major": None, "full": None, "confirmed": {}}
+    state = {"hwnd": 0, "major": None, "now": None, "full": None, "confirmed": {}}
 
     def refresh_status():
         admin = is_admin()
@@ -309,6 +313,7 @@ def main() -> int:  # noqa: C901 —— 單一視窗的版面,拆開反而難讀
         hwnd, title = find_his_window()
         state["hwnd"] = hwnd
         major, full = parse_his_version(title)
+        state["now"] = major
         # 讀不到版本(HIS 暫時關掉)→ 保留測試時的版本;換了版本 → 先前的實測作廢
         changed = bool(major and state["major"] and major != state["major"])
         if major:
@@ -398,11 +403,17 @@ def main() -> int:  # noqa: C901 —— 單一視窗的版面,拆開反而難讀
         yes_btn.config(state="disabled")
 
     def send_test():
+        before = state["major"]
+        refresh_status()      # 送出前重新抓視窗與版本:實測結果要綁定這個視窗的版本
         if not state["hwnd"]:
-            refresh_status()
-            if not state["hwnd"]:
-                messagebox.showwarning("找不到 HIS", "請先打開「西醫門診醫師作業」並掛入一位病人。")
-                return
+            messagebox.showwarning("找不到 HIS", "請先打開「西醫門診醫師作業」並掛入一位病人。")
+            return
+        if not state["now"]:
+            messagebox.showwarning("讀不到 HIS 版本", "HIS 視窗標題沒有版本號，無法測試。")
+            return
+        if before and before != state["major"]:
+            messagebox.showwarning("HIS 版本變了", "起始編號已更新，請再按一次「送出測試」。")
+            return
         cid = cand_var.get()
         send_menu_command(state["hwnd"], cid)
         last_sent.update(key=current_func()["key"], id=cid)

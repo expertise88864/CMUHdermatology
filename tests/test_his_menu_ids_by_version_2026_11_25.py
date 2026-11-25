@@ -59,8 +59,9 @@ def test_the_window_title_decides(monkeypatch, version, want):
     assert {n: main._his_menu_id(n, 1) for n in want} == want
 
 
-def test_unreadable_title_uses_the_last_sample(monkeypatch):
-    monkeypatch.setattr(main, "_his_title_of", lambda _h: "")
+@pytest.mark.parametrize("title", ["", "西醫門診醫師作業"])
+def test_unreadable_title_uses_the_last_sample(monkeypatch, title):
+    monkeypatch.setattr(main, "_his_title_of", lambda _h: title)
     monkeypatch.setattr(main, "_his_last_sample", ("1151117.01", "ok"))
     assert main._his_menu_id("MENU_ID_FINISH_NO_PRINT", 1) == 279
     monkeypatch.setattr(main, "_his_last_sample", ("", ""))
@@ -130,6 +131,14 @@ def test_an_override_bound_to_one_version_leaves_the_others(override):
     assert m.menu_ids_for("1151201") == NEW and m.menu_ids_for(None) == OLD
 
 
+def test_an_unreadable_version_uses_the_machine_calibration(override):
+    m = override({"his_version": "1151020", "MENU_ID_同意書": 680})
+    assert m.menu_ids_for(None)["MENU_ID_同意書"] == 680
+    assert m.menu_ids_for("1151103") == OLD, "讀得到的版本仍以實際版本比對綁定"
+    m = override({"CALIBRATED_VERSION": "1151117"})
+    assert m.menu_ids_for("") == NEW and m.menu_ids_for("1151020") == OLD
+
+
 def test_an_unbound_override_applies_to_every_version(override):
     m = override({"MENU_ID_同意書": 680})
     assert {m.menu_ids_for(v)["MENU_ID_同意書"] for v in ("1151020", "1151117")} == {680}
@@ -155,6 +164,8 @@ def test_the_fix_tool_binds_to_the_tested_version():
     assert tool.program_ids(hc, "1151117") == NEW
     data, err = tool.build_override(hc, None, {"MENU_ID_同意書": 680}, "1151117")
     assert err == "" and data["his_version"] == "1151117"
+    data_none, err = tool.build_override(hc, None, {"MENU_ID_同意書": 680}, None)
+    assert data_none == {} and "HIS 版本" in err
     # 另一個版本的舊內容不合併
     data, err = tool.build_override(hc, data, {"MENU_ID_代碼輸入": 222}, "1151020")
     assert err == "" and "MENU_ID_同意書" not in data

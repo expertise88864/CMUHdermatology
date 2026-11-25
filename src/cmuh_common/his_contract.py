@@ -64,7 +64,7 @@ def menu_ids_for(version) -> dict:
     沒登記的新版本 → 沿用比它舊的版本中最近的一個(改版通常接著前一版走;
     照樣會被判為改版而通知);讀不到版本、或比所有登記版本都舊 → CALIBRATED_VERSION。
     """
-    ver = str(version or "")
+    ver = str(version or CALIBRATED_VERSION)   # 讀不到 → 這台的校正版本(含快速修正)
     base = ver
     if ver not in MENU_IDS_BY_VERSION:
         older = [v for v in MENU_IDS_BY_VERSION

@@ -2706,8 +2706,8 @@ def _his_menu_id(name: str, main_hwnd: int) -> int:
 
     [2026-11-25 使用者] 各台電腦的 HIS 版本可能不同 → 依標題版本查 his_contract。
     標題這次讀不到 → 用剛才找視窗時的版本快照;都沒有 → 預設版本。"""
-    title = _his_title_of(main_hwnd)
-    ver = _his_title_version(title or f"V.{_his_last_sample[0]}")
+    ver = (_his_title_version(_his_title_of(main_hwnd))
+           or _his_title_version(f"V.{_his_last_sample[0]}"))
     menu_id = _HIS_CONTRACT.menu_ids_for(ver)[name]
     logging.info("[his-contract] HIS 版本 %s → %s=%s", ver or "(讀不到)", name, menu_id)
     return menu_id
