@@ -99,6 +99,20 @@ def build_override(hc, existing, confirmed: dict, his_version=None):
     return (data, "") if not err else ({}, err)
 
 
+def writable_ids(hc, confirmed: dict, tested: dict, major) -> dict:
+    """可以寫進快速修正的實測:送出測試當下就讀得到版本、且是現在這個版本。
+
+    測試時讀不到版本的只能回報(之後才讀到版本也不能補綁)。舊程式不分版本 → 全部可寫。"""
+    if not hasattr(hc, "menu_ids_for"):
+        return dict(confirmed)
+    return {k: v for k, v in confirmed.items() if major and tested.get(k) == major}
+
+
+def report_version(confirmed: dict, tested: dict, major, full):
+    """回報用的版本:有任何一個是讀不到版本時測的 → None(不可冒充成某一版)。"""
+    return full if all(tested.get(k) == major for k in confirmed) else None
+
+
 def override_status(hc, ov) -> dict:
     """步驟 1「本機快速修正」那一行的文字與顏色(用主程式同一套規則判斷有沒有效)。"""
     if ov is None:
@@ -302,7 +316,8 @@ def main() -> int:  # noqa: C901 —— 單一視窗的版面,拆開反而難讀
     st_ovr = label(s1, "")
     btns1 = ttk.Frame(s1)
     btns1.pack(anchor="w", padx=8, pady=4)
-    state = {"hwnd": 0, "major": None, "now": None, "full": None, "confirmed": {}}
+    state = {"hwnd": 0, "major": None, "now": None, "full": None, "confirmed": {},
+             "tested": {}}     # tested:{MENU_ID_*: 送出測試當下的版本(讀不到=None)}
 
     def refresh_status():
         admin = is_admin()
@@ -320,6 +335,7 @@ def main() -> int:  # noqa: C901 —— 單一視窗的版面,拆開反而難讀
             state["major"], state["full"] = major, full
         if changed:
             state["confirmed"].clear()
+            state["tested"].clear()
             refresh_summary()
             on_func_change()
         st_his.config(text=("✔ 已找到 HIS「西醫門診醫師作業」視窗" if hwnd else
@@ -382,7 +398,7 @@ def main() -> int:  # noqa: C901 —— 單一視窗的版面,拆開反而難讀
     ttk.Button(judge, text="✖ 不對，試下一個", style="Big.TButton",
                command=lambda: (step(+1), sent_var.set(
                    "請先把 HIS 剛才跳出的視窗關掉，再按「送出測試」"))).pack(side="left", padx=8)
-    last_sent = {"key": None, "id": None}
+    last_sent = {"key": None, "id": None, "ver": None}
 
     def current_func():
         return next(f for f in FUNCTIONS if f["key"] == func_var.get())
@@ -393,7 +409,7 @@ def main() -> int:  # noqa: C901 —— 單一視窗的版面,拆開反而難讀
                  else f["range"][0])
         cand_var.set(clamp_step(start, 0, f["range"]))
         success_lbl.config(text=f"正確的畫面：{f['success']}")
-        last_sent.update(key=None, id=None)
+        last_sent.update(key=None, id=None, ver=None)
         yes_btn.config(state="disabled")
         sent_var.set(f"（安全測試範圍 {f['range'][0]}～{f['range'][1]}）")
 
@@ -408,17 +424,15 @@ def main() -> int:  # noqa: C901 —— 單一視窗的版面,拆開反而難讀
         if not state["hwnd"]:
             messagebox.showwarning("找不到 HIS", "請先打開「西醫門診醫師作業」並掛入一位病人。")
             return
-        if not state["now"]:
-            messagebox.showwarning("讀不到 HIS 版本", "HIS 視窗標題沒有版本號，無法測試。")
-            return
         if before and before != state["major"]:
             messagebox.showwarning("HIS 版本變了", "起始編號已更新，請再按一次「送出測試」。")
             return
         cid = cand_var.get()
         send_menu_command(state["hwnd"], cid)
-        last_sent.update(key=current_func()["key"], id=cid)
+        last_sent.update(key=current_func()["key"], id=cid, ver=state["now"])
         yes_btn.config(state="normal")
-        sent_var.set(f"已送出編號 {cid} → 請看 HIS 畫面是不是「{current_func()['success']}」")
+        sent_var.set(f"已送出編號 {cid} → 請看 HIS 畫面是不是「{current_func()['success']}」"
+                     + ("" if state["now"] else "（讀不到 HIS 版本：只能回報，不能套用）"))
 
     def confirm_current():
         refresh_status()      # HIS 換了版本 → 清掉先前的實測
@@ -426,6 +440,7 @@ def main() -> int:  # noqa: C901 —— 單一視窗的版面,拆開反而難讀
             messagebox.showwarning("請先送出測試", "請先按「送出測試」並確認 HIS 畫面正確。")
             return
         state["confirmed"][last_sent["key"]] = last_sent["id"]
+        state["tested"][last_sent["key"]] = last_sent["ver"]
         refresh_summary()
         messagebox.showinfo("已記下", f"{current_func()['name']} ＝ {last_sent['id']}\n\n"
                                       "請把 HIS 剛跳出的視窗關掉。需要的話再選另一個功能測試，"
@@ -457,13 +472,21 @@ def main() -> int:  # noqa: C901 —— 單一視窗的版面,拆開反而難讀
         if not state["confirmed"]:
             messagebox.showwarning("沒有要寫的內容", "請先在步驟 3 確認至少一個功能的正確編號。")
             return
-        data, err = build_override(hc, read_override(hc), state["confirmed"],
-                                   state["major"])
+        ids = writable_ids(hc, state["confirmed"], state["tested"], state["major"])
+        if not ids:
+            apply_var.set("❌ 沒寫入：測試時讀不到 HIS 版本，無法判斷編號屬於哪一版。"
+                          "請按「複製回報內容」傳給開發者，或讀得到版本後重新測試")
+            return
+        data, err = build_override(hc, read_override(hc), ids, state["major"])
         if err:
             apply_var.set(f"❌ 沒寫入：{err}")
             return
-        what = "、".join(f"{f['name']}＝{state['confirmed'][f['key']]}" for f in FUNCTIONS
-                        if f["key"] in state["confirmed"])
+        what = "、".join(f"{f['name']}＝{ids[f['key']]}" for f in FUNCTIONS
+                        if f["key"] in ids)
+        skipped = "、".join(f["name"] for f in FUNCTIONS
+                           if f["key"] in state["confirmed"] and f["key"] not in ids)
+        if skipped:
+            what += f"\n\n不寫入（測試時讀不到 HIS 版本）：{skipped}"
         if not messagebox.askyesno(
                 "確定要套用嗎？",
                 f"將寫入這台電腦的本機快速修正：\n\n{what}\n\n"
@@ -493,7 +516,9 @@ def main() -> int:  # noqa: C901 —— 單一視窗的版面,拆開反而難讀
         refresh_status()
 
     def copy_report():
-        text = report_text(state["full"], state["confirmed"])
+        text = report_text(report_version(state["confirmed"], state["tested"],
+                                          state["major"], state["full"]),
+                           state["confirmed"])
         root.clipboard_clear()
         root.clipboard_append(text)
         apply_var.set(f"已複製：{text}")

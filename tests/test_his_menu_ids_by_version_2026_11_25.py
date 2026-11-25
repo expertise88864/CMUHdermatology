@@ -166,6 +166,37 @@ def test_the_fix_tool_binds_to_the_tested_version():
     assert err == "" and data["his_version"] == "1151117"
     data_none, err = tool.build_override(hc, None, {"MENU_ID_同意書": 680}, None)
     assert data_none == {} and "HIS 版本" in err
+    # 讀不到版本時測的:可以回報、不能寫入,之後才讀到版本也不補綁
+    ok, unknown = {"MENU_ID_代碼輸入": 221}, {"MENU_ID_同意書": 680}
+    both, tested = {**ok, **unknown}, {"MENU_ID_代碼輸入": "1151117", "MENU_ID_同意書": None}
+    assert tool.writable_ids(hc, both, tested, "1151117") == ok
+    assert tool.writable_ids(hc, unknown, {"MENU_ID_同意書": None}, None) == {}
+    assert tool.writable_ids(object(), both, tested, None) == both
+    assert tool.report_version(both, tested, "1151117", "1151117.01") is None
+    assert tool.report_version(ok, tested, "1151117", "1151117.01") == "1151117.01"
     # 另一個版本的舊內容不合併
     data, err = tool.build_override(hc, data, {"MENU_ID_代碼輸入": 222}, "1151020")
     assert err == "" and "MENU_ID_同意書" not in data
+
+
+@pytest.mark.parametrize("ver", [None, "1151117"])
+def test_send_test_probes_and_records_the_version_at_send_time(ver):
+    """直接執行 main() 裡的 send_test:沒有版本也要送得出去,並記下當時的版本。"""
+    import ast
+    import textwrap
+    from types import SimpleNamespace as NS
+    with open(os.path.join(ROOT, "HIS熱鍵ID修正工具.py"), encoding="utf-8") as f:
+        src = f.read()
+    node = next(n for n in ast.walk(ast.parse(src))
+                if isinstance(n, ast.FunctionDef) and n.name == "send_test")
+    code = textwrap.dedent(" " * node.col_offset + ast.get_source_segment(src, node))
+    sent, last = [], {"key": None, "id": None, "ver": "x"}
+    state = {"major": ver, "now": ver, "hwnd": 1}
+    ns = {"state": state, "refresh_status": lambda: None, "last_sent": last,
+          "cand_var": NS(get=lambda: 221), "send_menu_command": lambda h, i: sent.append(i),
+          "current_func": lambda: {"key": "K", "success": "s"},
+          "yes_btn": NS(config=lambda **_k: None), "sent_var": NS(set=lambda _t: None),
+          "messagebox": NS(showwarning=lambda *a: pytest.fail(str(a)))}
+    exec(code, ns)  # noqa: S102
+    ns["send_test"]()
+    assert sent == [221] and last == {"key": "K", "id": 221, "ver": ver}
