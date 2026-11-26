@@ -355,16 +355,23 @@ class PreferredWeekdaysRule(Rule):
 
     @staticmethod
     def day_weight(ctx) -> int:
-        """每一天指定星期的獎勵：嚴格大於「把這一天換給他」最多造成的點數偏差變動。
+        """每一天指定星期的獎勵：嚴格大於點數項【整體】可能的最大變動。
 
-        把一個平日(指定星期不含國定假日 → 點數 = weekday_point)從甲移給他,兩人的
-        絕對偏差最壞各變 weekday_point 點 → 2×weekday_point×100(scale)×POINT_WEIGHT;
-        再多加一整點(100×POINT_WEIGHT = 1,000,000)的餘裕,蓋過點數以下所有軟規則的
-        總和(班數全距、週五連動、連值懲罰合計遠小於 1,000,000)—— 只 +1 的話,
+        只算「一天換人」不夠(外審 PR #36 第 1 輪):週六日綁成一段,讓他拿到一個指定
+        星期可能要把整段週末(4 點以上)換給別人,點數偏差一次變好幾點。所以取點數項的
+        上界:每人 |點數 − 目標| ≤ 100×總點數 + |目標|(與 PointBalanceRule 同一套
+        scale),全部加總 × POINT_WEIGHT —— 任何排法改變點數項都不會超過它。
+        再加 10 點(10×100×POINT_WEIGHT)的餘裕,蓋過點數以下所有軟規則的總和
+        (班數全距、週五連動、複選時的連值懲罰,合計遠小於此)—— 只差一點點的話,
         班數全距會把「排到上限 12 班」的那一天又搶回去(實測)。
         → 求解器先排滿指定星期,點數差額進帳本。
         仍低於週末上限(見 WeekendCapRule.over_weight 已把全部指定星期獎勵算進去)。"""
-        return (2 * int(ctx.params.weekday_point) + 1) * 100 * POINT_WEIGHT
+        total = ctx.total_points()
+        n = max(len(ctx.members), 1)
+        bound = sum(100 * total
+                    + abs(round(100 * (total / n - float(ctx.ledger.get(m.id, 0.0)))))
+                    for m in ctx.members)
+        return (bound + 10 * 100) * POINT_WEIGHT
 
     def precheck(self, ctx):
         checks = []

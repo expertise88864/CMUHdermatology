@@ -76,6 +76,32 @@ def test_preference_never_breaks_the_hard_duty_cap():
     assert all(9 <= res.duty_counts[m.id] for m in ctx.members)
 
 
+def test_preference_wins_even_when_a_whole_weekend_must_move():
+    """[外審 PR #36 第 1 輪] 週六日綁一段:讓甲拿到指定的週三,得把整段週末(4 點)
+    換給乙 —— 點數變動不只一天的份量,指定星期仍要贏。"""
+    def D(n):
+        return date(2026, 8, n)
+    open_days = {26, 27, 29, 30}
+    weekends = {1: "a", 2: "a", 8: "b", 9: "b", 15: "c", 16: "c", 22: "c", 23: "c"}
+    need = {"a": 8, "b": 8, "c": 11}
+    must = {k: set() for k in need}
+    for n in range(1, 32):
+        if n in open_days:
+            continue
+        who = weekends.get(n) or max((k for k in "abc" if len(must[k]) < need[k]),
+                                     key=lambda k: need[k] - len(must[k]))
+        must[who].add(D(n))
+    ms = [Member("a", "a", "R1", fixed_weekdays=(0, 2)),
+          Member("b", "b", "R2"), Member("c", "c", "R3")]
+    ctx = make_ctx(members=ms, must=must, ledger={"a": -3.0, "b": 3.0, "c": 0.0})
+    ctx.params.duty_min = 10
+    res = solve_duty(ctx)
+    assert res.status == "ok"
+    assert res.assignments[D(26)] == "a"                     # 指定的週三
+    assert res.assignments[D(29)] == res.assignments[D(30)] == "b"   # 週末整段換給乙
+    assert all(res.duty_counts[m] >= 10 for m in "abc")
+
+
 def test_leave_and_must_duty_still_win():
     ctx = make_ctx(members=members(), leaves={"r1": {date(2026, 8, 5)}},
                    must={"r2": {date(2026, 8, 6)}})
@@ -120,6 +146,7 @@ def test_weight_ranking():
     w = PreferredWeekdaysRule.day_weight(ctx)
     assert w > DutyCountBalanceRule.RANGE_WEIGHT
     assert w > 2 * ctx.params.weekday_point * 100 * POINT_WEIGHT   # 一天換人的點數偏差
+    assert w > 100 * ctx.total_points() * len(ctx.members) * POINT_WEIGHT   # 點數項整體
     blocks = counted_blocks(ctx.blocks, ctx.weekend_exempt, ctx.holidays)
     assert WeekendCapRule.over_weight(ctx, blocks) > len(WED_THU) * w   # 週末上限仍最優先
 
