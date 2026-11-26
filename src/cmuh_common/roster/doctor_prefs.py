@@ -130,12 +130,16 @@ def possible_sessions(inp, slots, pref: DoctorPref, key_days) -> int:
     """「只換診間／同一天上下午互換」最多做得到的次數(給報告說明原因用)。
 
     每一天:同一個半天就有這位醫師的跟診,加上「換到同一天另一個半天」—— 那個半天
-    這個人必須是放假(有切片等工作就換不過去),家醫科不能換半天。是上限:固定人員、
-    鎖定與名額另外會再擋。key_days:這個人屬於這個期間的日期(Clerk 為整梯)。"""
+    這個人必須是放假(有切片等工作就換不過去),家醫科不能換半天。鎖定時段、固定人員、
+    Apply 本科 101 診換不動,只算原本就在這位醫師診的。是上限:沒有計算名額(要跟別人
+    互換時還要對方也願意換)。原本有跟其他醫師的人要留一次給其他醫師。
+    key_days:這個人屬於這個期間的日期(Clerk 為整梯)。"""
     from datetime import date
 
+    from .held import is_held
     from .solve_day import REST, STUDENT_SESSIONS, is_follow_slot
-    total = 0
+    total = known = 0
+    others = False
     for iso, sessions in slots.items():
         try:
             d = date.fromisoformat(iso)
@@ -144,17 +148,34 @@ def possible_sessions(inp, slots, pref: DoctorPref, key_days) -> int:
         if d not in key_days or not isinstance(sessions, dict):
             continue
         doctors = inp.clinic_doctors.get(d, {})
-        follow = {s for s in STUDENT_SESSIONS
-                  if any(pref.code in (ps or []) for r, ps in (sessions.get(s) or {}).items()
-                         if is_follow_slot(r))}
+        for s in STUDENT_SESSIONS:
+            for r, ps in (sessions.get(s) or {}).items():
+                name = doctors.get(s, {}).get(r)
+                if is_follow_slot(r) and pref.code in (ps or []) and name:
+                    known += 1
+                    others |= name != pref.doctor
+
+        def fixed(s, iso=iso):
+            return (s in ((getattr(inp, "locked", None) or {}).get(iso) or {})
+                    or is_held(inp, iso, s, pref.code))
+
+        rooms = {s: [r for r, ps in (sessions.get(s) or {}).items()
+                     if is_follow_slot(r) and pref.code in (ps or [])]
+                 for s in STUDENT_SESSIONS}
+        here = {s for s, rs in rooms.items()
+                if any(doctors.get(s, {}).get(r) == pref.doctor for r in rs)}
+        pinned = {s for s, rs in rooms.items()
+                  if pref.scope == "pgy" and pref.code in getattr(inp, "apply_pref", ())
+                  and "101" in rs and d.weekday() in (1, 4)}
+        movable = {s for s, rs in rooms.items() if rs and not fixed(s) and s not in pinned} - here
         clinic = {s for s in STUDENT_SESSIONS
                   if pref.doctor in (doctors.get(s) or {}).values()}
-        total += len(follow & clinic)
+        total += len(here) + len(movable & clinic)
         if pref.scope != "family":
-            free = [t for t in clinic - follow
-                    if pref.code in ((sessions.get(t) or {}).get(REST) or [])]
-            total += min(len(follow - clinic), len(free))
-    return total
+            free = {t for t in clinic if not rooms[t] and not fixed(t)
+                    and pref.code in ((sessions.get(t) or {}).get(REST) or [])}
+            total += min(len(movable - clinic), len(free))
+    return min(total, known - 1) if others else total
 
 
 def calendar_days(inp, scope: str, period: str) -> set:
@@ -241,7 +262,7 @@ def pref_warnings(inp, slots) -> list:
         line = f"{head} 指定 {pref.doctor}：目標 {pref.target}、實際 {got}"
         cap = possible_sessions(inp, merged, pref, days)
         if cap < pref.target:
-            line += (f"；這個人有排跟診的半天裡，{pref.doctor} 的門診最多只能換到 {cap} 次"
+            line += (f"；這個人有排跟診的半天裡，{pref.doctor} 的門診最多只能換到約 {cap} 次"
                      "（不會為了跟診改日子）")
         else:
             line += "；名額被優先順序較高的人占用，或受固定人員、鎖定時段、Apply 本科 101 診限制"

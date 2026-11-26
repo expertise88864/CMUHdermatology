@@ -154,7 +154,7 @@ def test_report_explains_a_missed_target():
                         DoctorPref("external", period, "X", "Z", 1))
     balance_rooms(inp, slots)
     text = "\n".join(dp.pref_warnings(inp, slots))
-    assert "目標 3、實際 1" in text and "最多只能換到 1 次" in text
+    assert "目標 3、實際 1" in text and "最多只能換到約 1 次" in text
     assert "Y 已不在本月名單" in text and "Z 在這段期間的門診表沒有門診" in text
 
 
@@ -280,7 +280,7 @@ def test_the_dialog_adds_and_saves(tmp_path, tk_root, monkeypatch):
     w = dlg.DoctorPrefsDialog(tk_root, svc, "2026-09")
     assert w.scope_var.get() == "外訓" and w.code_var.get() == "X"
     label = next(k for k, v in w._doctors.items() if v == "A")
-    assert "診" in label and "最多換到" in label
+    assert "診" in label and "最多約換到" in label
     w.doctor_var.set(label)
     w.target_var.set("3")
     w._add()
@@ -321,14 +321,15 @@ def test_a_cross_month_clerk_doctor_is_not_reported_missing():
 
 
 def test_the_upper_bound_needs_a_free_half_day():
-    d = DAYS[0]
-    inp = DaySolveInput("2026-09", {d: {"上午": ["101"], "下午": ["101"]}}, [], external_roster=["X"])
-    inp.clinic_doctors = {d: {"上午": {"101": "B"}, "下午": {"101": "A"}}}
+    days = DAYS[:2]
+    inp = DaySolveInput("2026-09", {d: {"上午": ["101"], "下午": ["101"]} for d in days}, [],
+                        external_roster=["X"])
+    inp.clinic_doctors = {d: {"上午": {"101": "B"}, "下午": {"101": "A"}} for d in days}
     pref = DoctorPref("external", "2026-09", "X", "A")
-    busy = {d.isoformat(): {"上午": {"101": ["X"]}, "下午": {BIOPSY: ["X"]}}}
-    free = {d.isoformat(): {"上午": {"101": ["X"]}, "下午": {REST: ["X"]}}}
-    assert dp.possible_sessions(inp, busy, pref, {d}) == 0
-    assert dp.possible_sessions(inp, free, pref, {d}) == 1
+    busy = {d.isoformat(): {"上午": {"101": ["X"]}, "下午": {BIOPSY: ["X"]}} for d in days}
+    free = {d.isoformat(): {"上午": {"101": ["X"]}, "下午": {REST: ["X"]}} for d in days}
+    assert dp.possible_sessions(inp, busy, pref, set(days)) == 0
+    assert dp.possible_sessions(inp, free, pref, set(days)) == 1, "兩天各換一次,但要留一次給 B"
 
 
 def test_the_dialog_list_and_baseline_come_from_one_read(tmp_path, monkeypatch):
@@ -349,3 +350,31 @@ def test_the_dialog_list_and_baseline_come_from_one_read(tmp_path, monkeypatch):
     ctx = svc.doctor_pref_context("2026-09")
     assert {p.doctor for p in ctx["prefs"]} == {"A", "B"}
     assert len(ctx["baseline"]["month"]) == 2
+
+
+@pytest.mark.parametrize("guard, want", [
+    (None, 1), ("locked", 0), ("held", 0), ("apply", 0), ("locked_with_a", 1)])
+def test_the_upper_bound_skips_sessions_that_cannot_move(guard, want):
+    days = [date(2026, 9, 8), date(2026, 9, 11)]          # 週二、週五
+    inp = DaySolveInput("2026-09", {d: {"上午": ["101", "102"]} for d in days}, ["X"])
+    inp.clinic_doctors = {d: {"上午": {"101": "B", "102": "A"}} for d in days}
+    slots = {d.isoformat(): {"上午": {"101": ["X"]}} for d in days}
+    if guard == "locked_with_a":
+        slots[days[0].isoformat()]["上午"] = {"102": ["X"]}
+        inp.locked = {days[0].isoformat(): deepcopy(slots[days[0].isoformat()])}
+    elif guard == "locked":
+        inp.locked = deepcopy(slots)
+    elif guard == "held":
+        inp.held = deepcopy(slots)
+        inp.held_people = {iso: {"上午": ["X"]} for iso in slots}
+    elif guard == "apply":
+        inp.apply_pref = {"X"}
+    pref = DoctorPref("pgy", "2026-09", "X", "A")
+    # 原本跟 B 的人要留一次給 B → 兩次跟診最多換到 1 次
+    assert dp.possible_sessions(inp, slots, pref, set(days)) == want
+    before = deepcopy(slots)
+    inp.doctor_prefs = (pref,)
+    balance_rooms(inp, slots)
+    assert doctor_counts(inp, slots, "X")["A"] == want, "估計與實際排班一致"
+    if not want:
+        assert slots == before

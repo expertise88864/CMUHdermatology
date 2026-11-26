@@ -64,11 +64,12 @@ class DoctorPrefsDialog(tk.Toplevel):
             "次數留空白＝盡量多；有填＝做到就好，之後也不會被換到少於這個次數。"
             "原本有跟其他醫師的人，至少保留一次其他醫師。\n"
             "名額不夠時依 Clerk ＞ 家醫科 ＞ 外訓 ＞ PGY。Clerk 的設定跟著梯次，跨月兩個月都有效。\n"
+            "「最多約換到」依目前班表估算，已扣除鎖定、固定人員與切片等工作，未計名額。\n"
             "儲存後要按「自動排班」才會套用。")).pack(anchor="w")
 
         cols = (("scope", "類別", 60), ("period", "梯次／月份", 190), ("code", "人員", 80),
                 ("doctor", "醫師", 110), ("target", "目標", 70),
-                ("clinic", "期間門診", 75), ("cap", "最多換到", 75))
+                ("clinic", "期間門診", 75), ("cap", "最多約換到", 85))
         self.tree = ttk.Treeview(self, columns=tuple(c[0] for c in cols), show="headings",
                                  height=8, selectmode="browse")
         for key, title, width in cols:
@@ -145,7 +146,7 @@ class DoctorPrefsDialog(tk.Toplevel):
             cap = possible_sessions(self.inp, self.slots,
                                     DoctorPref(scope, period, self.code_var.get(), name),
                                     days)
-            self._doctors[f"{name}（{sessions[name]} 診，目前班表最多換到 {cap} 次）"] = name
+            self._doctors[f"{name}（{sessions[name]} 診，目前班表最多約換到 {cap} 次）"] = name
         self._doctor_box.configure(values=tuple(self._doctors))
         self.doctor_var.set("")
 
