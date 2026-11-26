@@ -348,15 +348,23 @@ class PreferredWeekdaysRule(Rule):
     scope = "r"
     kind = "soft"
     rule_id = "preferred_weekdays"
-    描述 = ("[2026-11-24 使用者] R 複選值班星期（兩天以上）盡量排同一人：所有硬規則與"
-          "點數平衡優先，先用指定星期湊點數，不足才排其他天。"
+    描述 = ("[2026-11-24 使用者] R 複選值班星期（兩天以上）盡量排同一人。"
+          "[2026-11-26 使用者選 (A)] 指定星期優先於點數平衡：硬規則照舊，先把指定星期"
+          "排滿，點數不平的部分照常記進帳本、之後的月份再還。"
           "使用者選定：指定星期優先於避免連值 4、5 天")
 
-    # 權重:高於一整段 5 連的懲罰(見 ConsecutiveDutyRule 的 PREFERRED_*,合計 11,500)、
-    # 班數全距 1 單位(1,500)、週五連動(600);一個整數點的點數偏差是 1,000,000、週末
-    # 上限更高 → 這些不會為了指定星期而犧牲。
-    # (帳本帶小數時點數偏差可能只差不到 0.1 點,那種近乎同分的情況會讓給指定星期。)
-    DAY_WEIGHT = 20_000
+    @staticmethod
+    def day_weight(ctx) -> int:
+        """每一天指定星期的獎勵：嚴格大於「把這一天換給他」最多造成的點數偏差變動。
+
+        把一個平日(指定星期不含國定假日 → 點數 = weekday_point)從甲移給他,兩人的
+        絕對偏差最壞各變 weekday_point 點 → 2×weekday_point×100(scale)×POINT_WEIGHT;
+        再多加一整點(100×POINT_WEIGHT = 1,000,000)的餘裕,蓋過點數以下所有軟規則的
+        總和(班數全距、週五連動、連值懲罰合計遠小於 1,000,000)—— 只 +1 的話,
+        班數全距會把「排到上限 12 班」的那一天又搶回去(實測)。
+        → 求解器先排滿指定星期,點數差額進帳本。
+        仍低於週末上限(見 WeekendCapRule.over_weight 已把全部指定星期獎勵算進去)。"""
+        return (2 * int(ctx.params.weekday_point) + 1) * 100 * POINT_WEIGHT
 
     def precheck(self, ctx):
         checks = []
@@ -390,7 +398,8 @@ class PreferredWeekdaysRule(Rule):
 
     def objective_terms(self, mc, ctx):
         directives, _ = collect_directives(ctx)
-        return [(mc.x[(d, m.id)], -self.DAY_WEIGHT)
+        weight = self.day_weight(ctx)
+        return [(mc.x[(d, m.id)], -weight)
                 for m in ctx.members if m.fixed_weekdays
                 for d in preferred_weekday_days(ctx, m, directives)]
 
@@ -665,7 +674,7 @@ class ConsecutiveDutyRule(Rule):
     RUN4_WEIGHT = 3_000_000
     RUN5_WEIGHT = 10_000_000
     # [2026-11-24 使用者「選2」] R 有人複選值班星期時:指定星期優先於避免連值 4、5 天
-    # (一個 5 連 = 4,000+2×3,000+3×500 = 11,500 < DAY_WEIGHT)。VS 與沒人複選時不變。
+    # (一個 5 連 = 4,000+2×3,000+3×500 = 11,500 < 一天指定星期的獎勵)。VS 與沒人複選時不變。
     PREFERRED_RUN4_WEIGHT = 3_000
     PREFERRED_RUN5_WEIGHT = 4_000
 
@@ -765,7 +774,15 @@ class WeekendCapRule(Rule):
         找補（與 ConsecutiveDutyRule 同一套邏輯），符合使用者「仍要盡量最多兩個週末」。"""
         max_pts = max((b.points(ctx.holidays, ctx.params) for b in blocks),
                       default=0)
-        return 2 * max_pts * 100 * POINT_WEIGHT + 1
+        # [2026-11-26 使用者選 (A)] 指定星期優先於點數,但不優先於週末上限 → 再加上
+        # 【全部】指定星期獎勵的總和,讓多一個超額週末永遠比全部指定星期還重。
+        bonus = 0
+        if ctx.scope == "r" and any(m.fixed_weekdays for m in ctx.members):
+            directives, _ = collect_directives(ctx)
+            days = sum(len(preferred_weekday_days(ctx, m, directives))
+                       for m in ctx.members if m.fixed_weekdays)
+            bonus = days * PreferredWeekdaysRule.day_weight(ctx)
+        return 2 * max_pts * 100 * POINT_WEIGHT + 1 + bonus
 
     def objective_terms(self, mc, ctx):
         blocks = self._weekend_blocks(ctx)

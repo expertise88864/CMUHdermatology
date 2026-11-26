@@ -50,17 +50,30 @@ def test_preferred_weekdays_fill_first_without_hurting_points():
     assert any(res.reasons[d] == "指定星期" for d in WED_THU)
 
 
-def test_points_outrank_the_preference():
-    """點數已超前(帳本 +6)→ 不會為了指定星期排滿,班數與點數優先。"""
+def test_preference_outranks_points_and_the_gap_goes_to_the_ledger():
+    """[2026-11-26 使用者選 (A)] 指定星期優先於點數:帳本已超前(+6)也照樣排滿,
+    點數差額進帳本;硬規則(班數上限 12、每人 1–2 個週末)照舊。"""
+    ledger = {"r1": 6.0, "r2": -3.0, "r3": -3.0}
+    ctx = make_ctx(members=members(), ledger=ledger)
+    free = make_ctx(members=[Member(i, i, lv) for i, lv in
+                             (("r1", "R1"), ("r2", "R2"), ("r3", "R3"))], ledger=ledger)
+    res, base = solve_duty(ctx), solve_duty(free)
+    assert res.status == base.status == "ok"
+    assert got(res) == len(WED_THU) and got(base) < len(WED_THU)
+    assert dev(ctx, res) > dev(free, base)            # 點數讓步,差額進帳本
+    assert res.duty_counts["r1"] <= 12
+    assert all(1 <= sum(res.assignments[date(2026, 8, s)] == m.id
+                        for s in (1, 8, 15, 22, 29)) <= 2 for m in ctx.members)
+
+
+def test_preference_never_breaks_the_hard_duty_cap():
+    """五天全選、帳本超前:指定星期多於上限 → 停在硬上限 12 班,不會更多。"""
     ctx = make_ctx(members=members(first=(0, 1, 2, 3, 4)),
                    ledger={"r1": 6.0, "r2": -3.0, "r3": -3.0})
-    free = make_ctx(members=[Member(i, i, lv) for i, lv in
-                             (("r1", "R1"), ("r2", "R2"), ("r3", "R3"))],
-                    ledger={"r1": 6.0, "r2": -3.0, "r3": -3.0})
-    res, base = solve_duty(ctx), solve_duty(free)
+    res = solve_duty(ctx)
     assert res.status == "ok"
-    assert dev(ctx, res) == pytest.approx(dev(free, base))
-    assert res.duty_counts["r1"] <= 11
+    assert res.duty_counts["r1"] == 12
+    assert all(9 <= res.duty_counts[m.id] for m in ctx.members)
 
 
 def test_leave_and_must_duty_still_win():
@@ -101,7 +114,14 @@ def test_the_choice_is_part_of_the_input_fingerprint():
 
 
 def test_weight_ranking():
-    assert PreferredWeekdaysRule.DAY_WEIGHT > DutyCountBalanceRule.RANGE_WEIGHT
+    from cmuh_common.roster.rules import POINT_WEIGHT, WeekendCapRule
+    from cmuh_common.roster.rules import counted_blocks
+    ctx = make_ctx(members=members())
+    w = PreferredWeekdaysRule.day_weight(ctx)
+    assert w > DutyCountBalanceRule.RANGE_WEIGHT
+    assert w > 2 * ctx.params.weekday_point * 100 * POINT_WEIGHT   # 一天換人的點數偏差
+    blocks = counted_blocks(ctx.blocks, ctx.weekend_exempt, ctx.holidays)
+    assert WeekendCapRule.over_weight(ctx, blocks) > len(WED_THU) * w   # 週末上限仍最優先
 
 
 @pytest.mark.parametrize("raw, single, multi", [
@@ -260,7 +280,7 @@ def test_rules_are_unchanged_without_multiple_weekdays():
 def test_one_five_day_run_costs_less_than_one_preferred_day():
     c = ConsecutiveDutyRule
     assert (3 * c.RUN3_WEIGHT + 2 * c.PREFERRED_RUN4_WEIGHT + c.PREFERRED_RUN5_WEIGHT
-            < PreferredWeekdaysRule.DAY_WEIGHT)
+            < PreferredWeekdaysRule.day_weight(make_ctx(members=members())))
 
 
 @pytest.mark.parametrize("configured, want", [(11, 12), (12, 12), (13, 13)])
