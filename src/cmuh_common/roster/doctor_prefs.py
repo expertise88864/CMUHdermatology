@@ -129,11 +129,12 @@ def apply_edit(month: dict, ym: str, prefs, inherited, batch_ids) -> None:
 def possible_sessions(inp, slots, pref: DoctorPref, key_days) -> int:
     """「只換診間／同一天上下午互換」最多做得到的次數(給報告說明原因用)。
 
-    每一天:這個人有排跟診的半天數,與這位醫師有門診的半天數取小者;家醫科不能換
-    半天,只算同一個半天。key_days:這個人屬於這個期間的日期(Clerk 為整梯)。"""
+    每一天:同一個半天就有這位醫師的跟診,加上「換到同一天另一個半天」—— 那個半天
+    這個人必須是放假(有切片等工作就換不過去),家醫科不能換半天。是上限:固定人員、
+    鎖定與名額另外會再擋。key_days:這個人屬於這個期間的日期(Clerk 為整梯)。"""
     from datetime import date
 
-    from .solve_day import STUDENT_SESSIONS, is_follow_slot
+    from .solve_day import REST, STUDENT_SESSIONS, is_follow_slot
     total = 0
     for iso, sessions in slots.items():
         try:
@@ -148,9 +149,21 @@ def possible_sessions(inp, slots, pref: DoctorPref, key_days) -> int:
                          if is_follow_slot(r))}
         clinic = {s for s in STUDENT_SESSIONS
                   if pref.doctor in (doctors.get(s) or {}).values()}
-        total += (len(follow & clinic) if pref.scope == "family"
-                  else min(len(follow), len(clinic)))
+        total += len(follow & clinic)
+        if pref.scope != "family":
+            free = [t for t in clinic - follow
+                    if pref.code in ((sessions.get(t) or {}).get(REST) or [])]
+            total += min(len(follow - clinic), len(free))
     return total
+
+
+def calendar_days(inp, scope: str, period: str) -> set:
+    """這個期間在行事曆上的日期:Clerk 為整梯(含尚未排班的跨月部分),其他為本月。"""
+    days = set(inp.clinic_doctors) | set(inp.grid)
+    if scope == "clerk":
+        batch = next((b for b in inp.clerk_batches if b.id == period), None)
+        return {d for d in days if batch is not None and batch.covers(d)}
+    return {d for d in days if d.isoformat()[:7] == inp.ym}
 
 
 def _period_slots(inp, slots, pref: DoctorPref):
@@ -216,7 +229,8 @@ def pref_warnings(inp, slots) -> list:
             continue
         merged, days = _period_slots(inp, slots, pref)
         if not any(pref.doctor in (inp.clinic_doctors.get(d, {}).get(s) or {}).values()
-                   for d in days for s in ("上午", "下午")):
+                   for d in calendar_days(inp, pref.scope, pref.period)
+                   for s in ("上午", "下午")):
             out.append(f"{head} 指定的 {pref.doctor} 在這段期間的門診表沒有門診，設定未套用")
             continue
         if not pref.target:

@@ -2809,21 +2809,26 @@ class RosterService:
     def doctor_pref_context(self, ym: str) -> dict:
         """[2026-11-26 使用者] 「指定多跟醫師」對話框要的東西(顯示用、寬鬆讀取)。
 
-        inp:本月的排班輸入(名單、梯次、門診醫師、目前生效的指定);
-        inherited:Clerk 從上個月沿用、本月還沒自己設定的部分;
+        inp:本月的排班輸入(名單、梯次、門診醫師);
+        prefs:目前生效的指定;inherited:Clerk 從上個月沿用、本月還沒自己設定的部分;
         baseline:開窗時月檔的原始欄位(存檔時用來發現他機同時修改);
-        slots:上個月＋本月＋下個月已存的班表(算「最多換得到幾次」用)。"""
+        slots:上個月＋本月＋下個月已存的班表(算「最多換得到幾次」用)。
+
+        ★顯示的清單與 baseline 出自同一次讀取★(PR 審查):分兩次讀的話,中間他機
+        新增的一筆會「顯示舊的、基準新的」,存檔時通過檢查卻把對方那筆蓋掉。"""
         inp = self.build_day_input(ym)
-        month = self.storage.load_month(ym)
-        from .doctor_prefs import parse_doctor_prefs
+        months = {ymm: self.storage.load_month(ymm) for ymm in (prev_ym(ym), ym, next_ym(ym))}
+        month = months[ym]
+        from .doctor_prefs import effective_prefs, parse_doctor_prefs
         own = parse_doctor_prefs(month)[1]
+        prefs = effective_prefs(ym, month, months[prev_ym(ym)],
+                                [b.id for b in inp.clerk_batches])
         slots: dict = {}
-        for ymm in (prev_ym(ym), ym, next_ym(ym)):
-            slots.update({iso: v for iso, v in
-                          (self.storage.load_month(ymm).get("day_slots") or {}).items()
+        for ymm, data in months.items():
+            slots.update({iso: v for iso, v in (data.get("day_slots") or {}).items()
                           if iso[:7] == ymm})
-        return {"inp": inp,
-                "inherited": tuple(p for p in inp.doctor_prefs
+        return {"inp": inp, "prefs": prefs,
+                "inherited": tuple(p for p in prefs
                                    if p.scope == "clerk" and p.period not in own),
                 "baseline": copy.deepcopy(month.get("doctor_prefs")),
                 "finalized": bool(month.get("finalized")),

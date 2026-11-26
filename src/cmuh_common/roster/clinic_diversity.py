@@ -177,7 +177,7 @@ def balance_clinics(inp, slots, *, control=None):
                                     unique = Counter()
                                     for (k, name), n in dc.items():
                                         unique[k] += int(doctors_count[k, name] + n > 0) - int(doctors_count[k, name] > 0)
-                                    tiers, own = [0] * len(SCOPES), Counter()
+                                    tiers, own, undercut = [0] * len(SCOPES), Counter(), False
                                     for k in {kp, kq} - {None}:
                                         for name, goal in prefs.get(k, ()):
                                             n = dc.get((k, name), 0)
@@ -185,6 +185,11 @@ def balance_clinics(inp, slots, *, control=None):
                                                 change = short(k, name, goal, n) ** 2 - short(k, name, goal) ** 2
                                                 tiers[SCOPES.index(k[0])] += change
                                                 own[k] += change
+                                                # 已達標的次數不可再被換到目標以下(同一人的另一筆指定也不行)
+                                                undercut |= bool(goal and short(k, name, goal) == 0
+                                                                 and short(k, name, goal, n) > 0)
+                                    if undercut:
+                                        continue
                                     if any(n < 0 and not own[k] < 0 for k, n in unique.items()):
                                         continue  # No person's distinct-doctor coverage is sacrificed.
                                     if any(k in prefs and dc and other_doctors(k, {}) > 0 and other_doctors(k, dc) == 0

@@ -11,7 +11,7 @@ from cmuh_common.roster.course_balance import balance_rooms
 from cmuh_common.roster.doctor_follow import DoctorFollowRow
 from cmuh_common.roster.doctor_prefs import DoctorPref
 from cmuh_common.roster.model import ClerkBatch
-from cmuh_common.roster.solve_day import REST, DaySolveInput, day_input_fingerprint, is_follow_slot
+from cmuh_common.roster.solve_day import BIOPSY, REST, DaySolveInput, day_input_fingerprint, is_follow_slot
 from cmuh_common.roster.storage import validate_authoritative_month
 
 DAYS = [date(2026, 9, n) for n in (7, 8, 9, 10)]
@@ -73,7 +73,7 @@ def test_a_target_is_enough_and_never_undercut():
     assert doctor_counts(inp, slots, "X") == {"A": 2, "B": 2}, "做到目標就停"
 
 
-def contest(c_scope):
+def contest(c_scope, e_target=2):
     """兩人各一天一診,101＝A、102＝B,容量 1;開始時 C 在 B、E 在 A。"""
     days = [date(2026, 9, n) for n in (7, 8, 9)]
     inp = DaySolveInput("2026-09", {d: {"上午": ["101", "102"]} for d in days}, [], capacity=1)
@@ -87,15 +87,19 @@ def contest(c_scope):
     inp.clinic_doctors = {d: {"上午": {"101": "A", "102": "B"}} for d in days}
     slots = {d.isoformat(): {"上午": {"101": ["E"], "102": ["C"]}} for d in days}
     inp.doctor_prefs = (DoctorPref(c_scope, period, "C", "A", 2),
-                        DoctorPref("external", "2026-09", "E", "A", 2))
+                        DoctorPref("external", "2026-09", "E", "A", e_target))
     return inp, slots
 
 
 def test_higher_priority_wins_but_the_other_keeps_the_doctor():
-    inp, slots = contest("clerk")
+    inp, slots = contest("clerk", None)
     balance_rooms(inp, slots)
     assert doctor_counts(inp, slots, "C")["A"] == 2, "Clerk ＞ 外訓"
     assert doctor_counts(inp, slots, "E")["A"] == 1, "被換走的人不可少跟一位不同醫師"
+    inp, slots = contest("clerk", 2)
+    balance_rooms(inp, slots)
+    assert doctor_counts(inp, slots, "E")["A"] == 2, "外訓已達標 2 次,優先順序也不能換到目標以下"
+    assert doctor_counts(inp, slots, "C")["A"] == 1
     inp, slots = contest("external")
     balance_rooms(inp, slots)
     assert sorted(doctor_counts(inp, slots, p)["A"] for p in "CE") == [1, 2], \
@@ -290,3 +294,58 @@ def test_the_dialog_adds_and_saves(tmp_path, tk_root, monkeypatch):
     w._save()
     assert svc.build_day_input("2026-09").doctor_prefs == (
         DoctorPref("clerk", "B1", "C", "B"), DoctorPref("external", "2026-09", "X", "A", 3))
+
+
+# ── PR 審查第 1 輪 ──
+def test_a_second_preference_cannot_undercut_a_met_target():
+    inp, slots, period = one_person("external", ["101", "102", "101", "102"])
+    inp.doctor_prefs = (DoctorPref("external", period, "X", "A", 2),
+                        DoctorPref("external", period, "X", "B", 2))
+    slots = {d.isoformat(): {"上午": {r: ["X"]}} for d, r in zip(DAYS[:2], ["101", "102"], strict=True)}
+    inp.grid = {d: inp.grid[d] for d in DAYS[:2]}
+    balance_rooms(inp, slots)
+    assert doctor_counts(inp, slots, "X") == {"A": 2}, "A 已達標 2 次,不可為了 B 換到 1 次"
+
+
+def test_a_cross_month_clerk_doctor_is_not_reported_missing():
+    days = [date(2026, 9, 28), date(2026, 9, 29), date(2026, 10, 1)]
+    inp = DaySolveInput("2026-09", {d: {"上午": ["101"]} for d in days[:2]}, [],
+                        clerk_batches=[ClerkBatch("B1", days[0], ["C"])])
+    inp.clinic_doctors = {days[0]: {"上午": {"101": "B"}}, days[1]: {"上午": {"101": "B"}},
+                          days[2]: {"上午": {"101": "A"}}}
+    slots = {d.isoformat(): {"上午": {"101": ["C"]}} for d in days[:2]}
+    inp.doctor_prefs = (DoctorPref("clerk", "B1", "C", "A"),)
+    assert dp.pref_warnings(inp, slots) == []
+    inp.doctor_prefs = (DoctorPref("clerk", "B1", "C", "Z"),)
+    assert "沒有門診" in dp.pref_warnings(inp, slots)[0]
+
+
+def test_the_upper_bound_needs_a_free_half_day():
+    d = DAYS[0]
+    inp = DaySolveInput("2026-09", {d: {"上午": ["101"], "下午": ["101"]}}, [], external_roster=["X"])
+    inp.clinic_doctors = {d: {"上午": {"101": "B"}, "下午": {"101": "A"}}}
+    pref = DoctorPref("external", "2026-09", "X", "A")
+    busy = {d.isoformat(): {"上午": {"101": ["X"]}, "下午": {BIOPSY: ["X"]}}}
+    free = {d.isoformat(): {"上午": {"101": ["X"]}, "下午": {REST: ["X"]}}}
+    assert dp.possible_sessions(inp, busy, pref, {d}) == 0
+    assert dp.possible_sessions(inp, free, pref, {d}) == 1
+
+
+def test_the_dialog_list_and_baseline_come_from_one_read(tmp_path, monkeypatch):
+    svc = service(tmp_path)
+    svc.set_doctor_prefs("2026-09", (DoctorPref("external", "2026-09", "X", "A"),),
+                         baseline=None, inherited=(), batch_ids=["B1"])
+    real = svc.build_day_input
+
+    def racing(ym, **kw):
+        out = real(ym, **kw)
+        if ym == "2026-09" and not racing.done:       # 他機在兩次讀取之間又加了一筆
+            racing.done = True
+            svc.update_month(ym, lambda m: m["doctor_prefs"]["month"].append(
+                {"scope": "external", "code": "X", "doctor": "B", "target": None}))
+        return out
+    racing.done = False
+    monkeypatch.setattr(svc, "build_day_input", racing)
+    ctx = svc.doctor_pref_context("2026-09")
+    assert {p.doctor for p in ctx["prefs"]} == {"A", "B"}
+    assert len(ctx["baseline"]["month"]) == 2

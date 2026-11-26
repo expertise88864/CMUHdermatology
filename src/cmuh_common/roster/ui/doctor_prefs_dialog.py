@@ -8,7 +8,7 @@ import tkinter as tk
 from collections import Counter
 from tkinter import messagebox, ttk
 
-from ..doctor_prefs import LABELS, MAX_TARGET, DoctorPref, possible_sessions
+from ..doctor_prefs import LABELS, MAX_TARGET, DoctorPref, calendar_days, possible_sessions
 from .common import guard_write
 
 _SCOPE_OF = {v: k for k, v in LABELS.items()}
@@ -17,11 +17,7 @@ _ORDER = ("PGY", "Clerk", "外訓", "家醫科")
 
 def period_days(inp, scope: str, period: str) -> set:
     """這個期間的日期:Clerk 為整梯(含跨月),其他為本月。"""
-    days = set(inp.clinic_doctors) | set(inp.grid)
-    if scope == "clerk":
-        batch = next((b for b in inp.clerk_batches if b.id == period), None)
-        return {d for d in days if batch is not None and batch.covers(d)}
-    return {d for d in days if d.isoformat()[:7] == inp.ym}
+    return calendar_days(inp, scope, period)
 
 
 def doctor_sessions(inp, days) -> Counter:
@@ -59,7 +55,7 @@ class DoctorPrefsDialog(tk.Toplevel):
         ctx = service.doctor_pref_context(ym)
         self.inp, self.slots = ctx["inp"], ctx["slots"]
         self.baseline, self.inherited = ctx["baseline"], ctx["inherited"]
-        self.prefs = list(self.inp.doctor_prefs)
+        self.prefs = list(ctx["prefs"])
         self.title(f"指定多跟醫師 · {ym}")
         self.transient(master)
         ttk.Label(self, padding=8, justify="left", text=(
