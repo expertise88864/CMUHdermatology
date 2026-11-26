@@ -18,9 +18,9 @@ DAYS = [date(2026, 9, n) for n in (7, 8, 9, 10)]
 
 
 def doctor_counts(inp, slots, person):
-    return Counter(inp.clinic_doctors[date.fromisoformat(iso)][s][r]
-                   for iso, ss in slots.items() for s, cells in ss.items()
-                   for r, people in cells.items() if is_follow_slot(r) and person in people)
+    return Counter(name for iso, ss in slots.items() for s, cells in ss.items()
+                   for r, people in cells.items() if is_follow_slot(r) and person in people
+                   if (name := inp.clinic_doctors[date.fromisoformat(iso)][s].get(r)))
 
 
 def follows(slots, person):
@@ -401,3 +401,20 @@ def test_the_upper_bound_counts_unnamed_rooms_and_freezes_other_months():
     assert dp.possible_sessions(inp, history, pref, set(sep)) == 0, "上個月已排的換不動"
     history[sep[0].isoformat()] = {"上午": {"102": ["C"]}}
     assert dp.possible_sessions(inp, history, pref, set(sep)) == 1, "原本就在 A 的照算"
+
+
+@pytest.mark.parametrize("lock_unnamed, want", [(True, 0), (False, 1)])
+def test_a_locked_unnamed_visit_does_not_count_as_the_kept_other_doctor(lock_unnamed, want):
+    days = [date(2026, 9, 8), date(2026, 9, 9)]
+    inp = DaySolveInput("2026-09", {d: {"上午": ["101", "102", "103"]} for d in days}, [],
+                        external_roster=["X"])
+    inp.clinic_doctors = {d: {"上午": {"101": "B", "102": "A"}} for d in days}   # 103 沒標示
+    slots = {days[0].isoformat(): {"上午": {"101": ["X"]}},
+             days[1].isoformat(): {"上午": {"103": ["X"]}}}
+    if lock_unnamed:
+        inp.locked = {days[1].isoformat(): deepcopy(slots[days[1].isoformat()])}
+    pref = DoctorPref("external", "2026-09", "X", "A")
+    assert dp.possible_sessions(inp, slots, pref, set(days)) == want
+    inp.doctor_prefs = (pref,)
+    balance_rooms(inp, slots)
+    assert doctor_counts(inp, slots, "X")["A"] == want, "估計與實際排班一致"

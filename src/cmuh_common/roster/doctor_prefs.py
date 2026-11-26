@@ -139,8 +139,7 @@ def possible_sessions(inp, slots, pref: DoctorPref, key_days) -> int:
 
     from .held import is_held
     from .solve_day import REST, STUDENT_SESSIONS, is_follow_slot
-    total = follows = 0
-    others = False
+    total = named_other = named_moved = 0     # 跟其他(有標示)醫師的次數/其中被算成可換走的
     for iso, sessions in slots.items():
         try:
             d = date.fromisoformat(iso)
@@ -149,12 +148,6 @@ def possible_sessions(inp, slots, pref: DoctorPref, key_days) -> int:
         if d not in key_days or not isinstance(sessions, dict):
             continue
         doctors = inp.clinic_doctors.get(d, {})
-        for s in STUDENT_SESSIONS:
-            for r, ps in (sessions.get(s) or {}).items():
-                if is_follow_slot(r) and pref.code in (ps or []):
-                    follows += 1          # 沒標示醫師的診也換得到指定醫師
-                    name = doctors.get(s, {}).get(r)
-                    others |= bool(name) and name != pref.doctor
 
         def fixed(s, iso=iso):
             # 別的月份(跨月梯次的上個月／下個月)只是歷史或之後才排,這次換不動
@@ -172,12 +165,26 @@ def possible_sessions(inp, slots, pref: DoctorPref, key_days) -> int:
         movable = {s for s, rs in rooms.items() if rs and not fixed(s) and s not in pinned} - here
         clinic = {s for s in STUDENT_SESSIONS
                   if pref.doctor in (doctors.get(s) or {}).values()}
-        total += len(here) + len(movable & clinic)
+
+        def named(s, doctors=doctors, rooms=rooms):
+            return any(doctors.get(s, {}).get(r) not in (None, "", pref.doctor) for r in rooms[s])
+
+        named_other += sum(named(s) for s in rooms if rooms[s] and s not in here)
+        same = movable & clinic
+        total += len(here) + len(same)
+        named_moved += sum(named(s) for s in same)
         if pref.scope != "family":
             free = {t for t in clinic if not rooms[t] and not fixed(t)
                     and pref.code in ((sessions.get(t) or {}).get(REST) or [])}
-            total += min(len(movable - clinic), len(free))
-    return min(total, follows - 1) if others else total
+            rest = movable - clinic
+            cross = min(len(rest), len(free))
+            total += cross
+            # 換半天時先換沒標示醫師的,有標示其他醫師的盡量留下
+            named_moved += max(0, cross - sum(not named(s) for s in rest))
+    # 原本有跟其他醫師 → 至少留一次;換不動的那一次本來就留著,全部都可換走才扣一次
+    if named_other and named_other == named_moved:
+        total -= 1
+    return max(0, total)
 
 
 def calendar_days(inp, scope: str, period: str) -> set:
