@@ -169,12 +169,14 @@ class DoctorPrefsDialog(tk.Toplevel):
         self.prefs.append(pref)
         self.target_var.set("")
         self._render()
+        self._person_changed()      # 指定清單變了 → 下拉選單的「最多約換到」重算
 
     def _remove(self):
         sel = self.tree.selection()
         if sel:
             del self.prefs[int(sel[0])]
             self._render()
+            self._person_changed()
 
     def _render(self):
         self.tree.delete(*self.tree.get_children())

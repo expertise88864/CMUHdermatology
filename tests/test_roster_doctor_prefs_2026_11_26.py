@@ -436,3 +436,24 @@ def test_another_preferred_doctor_need_not_be_kept():
     assert dp.possible_sessions(inp, slots, a, set(days)) == 1
     balance_rooms(inp, slots)
     assert doctor_counts(inp, slots, "X")["A"] == 1, "估計與實際排班一致"
+
+
+def test_the_dropdown_estimate_follows_unsaved_edits(tmp_path, tk_root, monkeypatch):
+    from cmuh_common.roster.ui import doctor_prefs_dialog as dlg
+    svc = service(tmp_path)
+    monkeypatch.setattr(dlg.tk.Toplevel, "grab_set", lambda self: None)
+    w = dlg.DoctorPrefsDialog(tk_root, svc, "2026-09")
+    calls = []
+    real = dlg.possible_sessions
+    monkeypatch.setattr(dlg, "possible_sessions",
+                        lambda *a: calls.append(len(a[4])) or real(*a))
+    w._person_changed()
+    assert calls and set(calls) == {0}
+    calls.clear()
+    w.doctor_var.set(next(k for k, v in w._doctors.items() if v == "B"))
+    w._add()
+    assert 1 in calls, "加入後下拉選單以新的清單重算"
+    calls.clear()
+    w.tree.selection_set("0")
+    w._remove()
+    assert calls and set(calls) == {0}, "刪除後也重算"
