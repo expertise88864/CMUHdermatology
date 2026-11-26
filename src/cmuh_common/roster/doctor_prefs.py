@@ -126,7 +126,7 @@ def apply_edit(month: dict, ym: str, prefs, inherited, batch_ids) -> None:
     parse_doctor_prefs(month)          # 寫入前再驗一次形狀
 
 
-def possible_sessions(inp, slots, pref: DoctorPref, key_days) -> int:
+def possible_sessions(inp, slots, pref: DoctorPref, key_days, prefs=None) -> int:
     """「只換診間／同一天上下午互換」最多做得到的次數(給報告說明原因用)。
 
     每一天:同一個半天就有這位醫師的跟診,加上「換到同一天另一個半天」—— 那個半天
@@ -134,11 +134,14 @@ def possible_sessions(inp, slots, pref: DoctorPref, key_days) -> int:
     Apply 本科 101 診換不動,只算原本就在這位醫師診的。是上限:沒有計算名額(要跟別人
     互換時還要對方也願意換)。原本有跟其他醫師的人要留一次給其他醫師。
     不在本月的日期(跨月梯次的另一半)換不動,只算原本就在這位醫師診的。
-    key_days:這個人屬於這個期間的日期(Clerk 為整梯)。"""
+    key_days:這個人屬於這個期間的日期(Clerk 為整梯)。prefs:這個人所有的指定(預設取
+    `inp.doctor_prefs`;對話框傳尚未存檔的清單)—— 指定的醫師都不必「留一次」。"""
     from datetime import date
 
     from .held import is_held
     from .solve_day import REST, STUDENT_SESSIONS, is_follow_slot
+    kept_out = {pref.doctor} | {p.doctor for p in (inp.doctor_prefs if prefs is None else prefs)
+                                if p.key == pref.key}
     total = named_other = named_moved = 0     # 跟其他(有標示)醫師的次數/其中被算成可換走的
     for iso, sessions in slots.items():
         try:
@@ -167,7 +170,7 @@ def possible_sessions(inp, slots, pref: DoctorPref, key_days) -> int:
                   if pref.doctor in (doctors.get(s) or {}).values()}
 
         def named(s, doctors=doctors, rooms=rooms):
-            return any(doctors.get(s, {}).get(r) not in (None, "", pref.doctor) for r in rooms[s])
+            return any((doctors.get(s, {}).get(r) or "") not in kept_out | {""} for r in rooms[s])
 
         named_other += sum(named(s) for s in rooms if rooms[s] and s not in here)
         same = movable & clinic

@@ -418,3 +418,21 @@ def test_a_locked_unnamed_visit_does_not_count_as_the_kept_other_doctor(lock_unn
     inp.doctor_prefs = (pref,)
     balance_rooms(inp, slots)
     assert doctor_counts(inp, slots, "X")["A"] == want, "估計與實際排班一致"
+
+
+def test_another_preferred_doctor_need_not_be_kept():
+    days = [date(2026, 9, 8), date(2026, 9, 9)]
+    inp = DaySolveInput("2026-09", {d: {"上午": ["101", "102", "103"]} for d in days}, [],
+                        external_roster=["X"])
+    inp.clinic_doctors = {d: {"上午": {"101": "B", "102": "A"}} for d in days}
+    slots = {days[0].isoformat(): {"上午": {"101": ["X"]}},
+             days[1].isoformat(): {"上午": {"103": ["X"]}}}
+    inp.locked = {days[1].isoformat(): deepcopy(slots[days[1].isoformat()])}
+    a = DoctorPref("external", "2026-09", "X", "A", 4)
+    b = DoctorPref("external", "2026-09", "X", "B")
+    assert dp.possible_sessions(inp, slots, a, set(days), [a]) == 0
+    assert dp.possible_sessions(inp, slots, a, set(days), [a, b]) == 1, "對話框尚未存檔的清單"
+    inp.doctor_prefs = (a, b)
+    assert dp.possible_sessions(inp, slots, a, set(days)) == 1
+    balance_rooms(inp, slots)
+    assert doctor_counts(inp, slots, "X")["A"] == 1, "估計與實際排班一致"

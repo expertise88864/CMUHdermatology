@@ -145,7 +145,7 @@ class DoctorPrefsDialog(tk.Toplevel):
         for name in sorted(sessions):
             cap = possible_sessions(self.inp, self.slots,
                                     DoctorPref(scope, period, self.code_var.get(), name),
-                                    days)
+                                    days, self.prefs)
             self._doctors[f"{name}（{sessions[name]} 診，目前班表最多約換到 {cap} 次）"] = name
         self._doctor_box.configure(values=tuple(self._doctors))
         self.doctor_var.set("")
@@ -184,7 +184,7 @@ class DoctorPrefsDialog(tk.Toplevel):
                 LABELS[p.scope], p.period if p.scope == "clerk" else f"{p.period}（整月）",
                 p.code, p.doctor, p.target or "盡量多",
                 doctor_sessions(self.inp, days).get(p.doctor, 0),
-                possible_sessions(self.inp, self.slots, p, days)))
+                possible_sessions(self.inp, self.slots, p, days, self.prefs)))
 
     def _save(self):
         ids = [b.id for b in self.inp.clerk_batches]
