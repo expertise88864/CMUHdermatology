@@ -378,3 +378,26 @@ def test_the_upper_bound_skips_sessions_that_cannot_move(guard, want):
     assert doctor_counts(inp, slots, "X")["A"] == want, "估計與實際排班一致"
     if not want:
         assert slots == before
+
+
+def test_the_upper_bound_counts_unnamed_rooms_and_freezes_other_months():
+    days = [date(2026, 9, 8), date(2026, 9, 9)]
+    inp = DaySolveInput("2026-09", {d: {"上午": ["101", "102", "103"]} for d in days}, [],
+                        external_roster=["X"])
+    inp.clinic_doctors = {d: {"上午": {"101": "B", "102": "A"}} for d in days}   # 103 沒標示
+    slots = {days[0].isoformat(): {"上午": {"101": ["X"]}},
+             days[1].isoformat(): {"上午": {"103": ["X"]}}}
+    pref = DoctorPref("external", "2026-09", "X", "A")
+    assert dp.possible_sessions(inp, slots, pref, set(days)) == 1
+    inp.doctor_prefs = (pref,)
+    balance_rooms(inp, slots)
+    assert doctor_counts(inp, slots, "X") == {"A": 1, "B": 1}, "估計與實際排班一致"
+
+    sep = [date(2026, 9, 28), date(2026, 9, 29)]
+    inp = DaySolveInput("2026-10", {}, [], clerk_batches=[ClerkBatch("B1", sep[0], ["C"])])
+    inp.clinic_doctors = {d: {"上午": {"101": "B", "102": "A"}} for d in sep}
+    history = {d.isoformat(): {"上午": {"101": ["C"]}} for d in sep}
+    pref = DoctorPref("clerk", "B1", "C", "A")
+    assert dp.possible_sessions(inp, history, pref, set(sep)) == 0, "上個月已排的換不動"
+    history[sep[0].isoformat()] = {"上午": {"102": ["C"]}}
+    assert dp.possible_sessions(inp, history, pref, set(sep)) == 1, "原本就在 A 的照算"

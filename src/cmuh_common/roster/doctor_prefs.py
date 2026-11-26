@@ -133,12 +133,13 @@ def possible_sessions(inp, slots, pref: DoctorPref, key_days) -> int:
     這個人必須是放假(有切片等工作就換不過去),家醫科不能換半天。鎖定時段、固定人員、
     Apply 本科 101 診換不動,只算原本就在這位醫師診的。是上限:沒有計算名額(要跟別人
     互換時還要對方也願意換)。原本有跟其他醫師的人要留一次給其他醫師。
+    不在本月的日期(跨月梯次的另一半)換不動,只算原本就在這位醫師診的。
     key_days:這個人屬於這個期間的日期(Clerk 為整梯)。"""
     from datetime import date
 
     from .held import is_held
     from .solve_day import REST, STUDENT_SESSIONS, is_follow_slot
-    total = known = 0
+    total = follows = 0
     others = False
     for iso, sessions in slots.items():
         try:
@@ -150,13 +151,14 @@ def possible_sessions(inp, slots, pref: DoctorPref, key_days) -> int:
         doctors = inp.clinic_doctors.get(d, {})
         for s in STUDENT_SESSIONS:
             for r, ps in (sessions.get(s) or {}).items():
-                name = doctors.get(s, {}).get(r)
-                if is_follow_slot(r) and pref.code in (ps or []) and name:
-                    known += 1
-                    others |= name != pref.doctor
+                if is_follow_slot(r) and pref.code in (ps or []):
+                    follows += 1          # 沒標示醫師的診也換得到指定醫師
+                    name = doctors.get(s, {}).get(r)
+                    others |= bool(name) and name != pref.doctor
 
         def fixed(s, iso=iso):
-            return (s in ((getattr(inp, "locked", None) or {}).get(iso) or {})
+            # 別的月份(跨月梯次的上個月／下個月)只是歷史或之後才排,這次換不動
+            return (iso[:7] != inp.ym or s in ((getattr(inp, "locked", None) or {}).get(iso) or {})
                     or is_held(inp, iso, s, pref.code))
 
         rooms = {s: [r for r, ps in (sessions.get(s) or {}).items()
@@ -175,7 +177,7 @@ def possible_sessions(inp, slots, pref: DoctorPref, key_days) -> int:
             free = {t for t in clinic if not rooms[t] and not fixed(t)
                     and pref.code in ((sessions.get(t) or {}).get(REST) or [])}
             total += min(len(movable - clinic), len(free))
-    return min(total, known - 1) if others else total
+    return min(total, follows - 1) if others else total
 
 
 def calendar_days(inp, scope: str, period: str) -> set:
