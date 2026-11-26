@@ -31,6 +31,8 @@ def _reduce_manual_pgy_follow(inp, slots, people, log):
     for p in people:
         if offsets.get(p, 0) >= 0:
             continue
+        preferred = {pref.doctor for pref in getattr(inp, "doctor_prefs", ()) or ()
+                     if pref.key == ("pgy", inp.ym, p)}
         while True:
             counts, weekly, daily, doctors = Counter(), Counter(), Counter(), Counter()
             candidates = []
@@ -85,6 +87,8 @@ def _reduce_manual_pgy_follow(inp, slots, people, log):
                 key=lambda item: (
                     not (p in inp.apply_pref and item[3] == "101"
                          and item[0].weekday() in (1, 4)),
+                    # [2026-11-26] 指定多跟的醫師最後才減
+                    item[4] not in preferred,
                     weekly[item[0].isocalendar()[:2], p],
                     -dropped_weeks[item[0].isocalendar()[:2], p],
                     doctors[p, item[4]] if item[4] else 0,

@@ -207,7 +207,8 @@ class DayScheduleTab(ttk.Frame):
                           ("外訓請假…", lambda: self._on_leave("external")),
                           ("當月家醫科人員…", self._edit_family_roster),
                           ("家醫科請假…", lambda: self._on_leave("family")),
-                          ("家醫科可跟診時段…", self._edit_family_follow)):
+                          ("家醫科可跟診時段…", self._edit_family_follow),
+                          ("指定多跟醫師…", self._edit_doctor_prefs)):
             b = ttk.Button(bar3, text=text, command=cmd)
             b.pack(side="left", padx=4)
             self._edit_btns.append(b)
@@ -927,6 +928,20 @@ class DayScheduleTab(ttk.Frame):
             messagebox.showinfo("家醫科可跟診時段", "請先設定當月家醫科人員（最多 2 人）", parent=self)
             return
         dlg = _FamilyFollowDialog(self, self.service, self.app.ym)
+        self.wait_window(dlg)
+        self.refresh()
+
+    def _edit_doctor_prefs(self) -> None:
+        """[2026-11-26 使用者] 指定某人多跟某位醫師(下次自動排班生效)。"""
+        if self._finalized:
+            return
+        from .doctor_prefs_dialog import DoctorPrefsDialog
+        try:
+            dlg = DoctorPrefsDialog(self, self.service, self.app.ym)
+        except Exception as e:  # noqa: BLE001
+            logging.exception("[roster.ui] 指定多跟醫師讀取失敗")
+            messagebox.showerror("指定多跟醫師", f"讀取失敗：\n{e}", parent=self)
+            return
         self.wait_window(dlg)
         self.refresh()
 

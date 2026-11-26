@@ -331,5 +331,10 @@ def finish_courses(inp, slots, log, warnings, *, control=None):
     warnings.extend(training_warnings(inp, slots, scopes=("pgy",)))
     warnings.extend(held_conflicts(inp))
     enforce_held(inp, slots)
+    from .doctor_prefs import pref_warnings
+    warnings.extend(pref_warnings(inp, slots))
+    if getattr(inp, "doctor_prefs", ()):
+        log.append("指定多跟醫師：只在同一個半天換診間或同一天上下午互換，不改日子與次數；"
+                   "優先順序 Clerk ＞ 家醫科 ＞ 外訓 ＞ PGY")
     log.append("依 course 優先平衡實際跟診醫師，再平衡診間；保留各人跟診次數、特殊工作、家醫可參與時段與鎖定內容")
     return slots, log, warnings

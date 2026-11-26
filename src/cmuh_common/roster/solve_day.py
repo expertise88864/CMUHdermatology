@@ -792,6 +792,8 @@ class DaySolveInput:
     apply_pref: set = field(default_factory=set)  # Apply 本科 PGY（101 週二/五平手優先）
     clinic_doctors: dict = field(default_factory=dict)  # {date: {session: {room: doctor}}}
     pgy_photo_offsets: dict = field(default_factory=dict)  # monthly relative photo targets
+    # [2026-11-26 使用者] 指定多跟醫師(`doctor_prefs.DoctorPref`);空＝原行為。
+    doctor_prefs: tuple = ()
     training: TrainingParams = field(default_factory=TrainingParams)
     # [2026-11-10 使用者] 人員固定:{iso: {時段: {格: [代號]}}} 與 {iso: {時段: [代號]}}。
     #   同一格其他人照常排;語意與所有判斷見 `held.py`。空 = 沒有人被固定(原行為)。

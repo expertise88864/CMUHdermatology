@@ -517,6 +517,8 @@ def validate_authoritative_month(ym: str, raw: dict) -> None:
     external_month_codes(raw)
     family_month_codes(raw)
     family_follow_slots(ym, raw)
+    from .doctor_prefs import parse_doctor_prefs
+    parse_doctor_prefs(raw)
     for scope in ("r", "vs"):
         duty = raw.get(f"{scope}_duty")
         if duty is not None and not isinstance(duty, dict):

@@ -1075,6 +1075,7 @@ class RosterService:
             prior_pgy = {str(x) for x in prev_pgy}
 
         from .training_params import TrainingParams
+        from .doctor_prefs import effective_prefs
         inp = DaySolveInput(
             training=TrainingParams.from_config(cfg),
             ym=ym, grid=grid, pgy_roster=list(pgy_roster), clinic_doctors=clinic_doctors,
@@ -1097,7 +1098,9 @@ class RosterService:
             capacity=RosterParams.from_config(cfg).room_capacity, locked=locked,
             prior_sessions=prior_sessions, prior_pgy=prior_pgy,
             apply_pref={str(c) for c in (month.get("pgy_apply_pref") or [])},
-            pgy_photo_offsets=dict(month.get("pgy_photo_offsets") or {}))
+            pgy_photo_offsets=dict(month.get("pgy_photo_offsets") or {}),
+            doctor_prefs=effective_prefs(ym, month, st.load_month(prev_ym(ym)),
+                                         [b.id for b in covering]))
         if held is not None:
             # [2026-11-10] 固定的位置取自目前存檔的班表 —— 它也進了指紋,預覽
             #   期間有人改了班表,套用時就會被判過期。
@@ -1868,6 +1871,7 @@ class RosterService:
                 "batches": batches_out}
         from .day_explanation import explain_day_courses
         data["explanation"] = explain_day_courses(inp, data, cur_slots)
+        data["doctor_prefs"] = tuple(inp.doctor_prefs)
         from .day_diagnostics import diagnose_day
         adjacent_grid = {}
         if adjacent_months:
@@ -2800,6 +2804,46 @@ class RosterService:
                 c for c in sorted(merged) if c not in codes]
             self._audit(month, "pgy", f"{ym} apply_pref", old,
                         month["pgy_apply_pref"], "manual")
+        self.update_month(ym, _mut)
+
+    def doctor_pref_context(self, ym: str) -> dict:
+        """[2026-11-26 使用者] 「指定多跟醫師」對話框要的東西(顯示用、寬鬆讀取)。
+
+        inp:本月的排班輸入(名單、梯次、門診醫師、目前生效的指定);
+        inherited:Clerk 從上個月沿用、本月還沒自己設定的部分;
+        baseline:開窗時月檔的原始欄位(存檔時用來發現他機同時修改);
+        slots:上個月＋本月＋下個月已存的班表(算「最多換得到幾次」用)。"""
+        inp = self.build_day_input(ym)
+        month = self.storage.load_month(ym)
+        from .doctor_prefs import parse_doctor_prefs
+        own = parse_doctor_prefs(month)[1]
+        slots: dict = {}
+        for ymm in (prev_ym(ym), ym, next_ym(ym)):
+            slots.update({iso: v for iso, v in
+                          (self.storage.load_month(ymm).get("day_slots") or {}).items()
+                          if iso[:7] == ymm})
+        return {"inp": inp,
+                "inherited": tuple(p for p in inp.doctor_prefs
+                                   if p.scope == "clerk" and p.period not in own),
+                "baseline": copy.deepcopy(month.get("doctor_prefs")),
+                "finalized": bool(month.get("finalized")),
+                "slots": slots}
+
+    def set_doctor_prefs(self, ym: str, prefs, *, baseline, inherited,
+                         batch_ids) -> None:
+        """存對話框裡的完整清單。開窗之後他機改過同一欄 → 拒絕,請重新開啟
+        (兩邊各自的增刪合併後很難說清楚,這裡寧可明講)。"""
+        from .doctor_prefs import apply_edit
+
+        def _mut(month):
+            if month.get("finalized"):
+                raise FinalizedMonthError(f"{ym} 已定案（唯讀）")
+            old = copy.deepcopy(month.get("doctor_prefs"))
+            if old != baseline:
+                raise ValueError("其他電腦剛修改了本月的指定多跟醫師，請關閉視窗後重新開啟再設定。")
+            apply_edit(month, ym, prefs, inherited, batch_ids)
+            self._audit(month, "day", f"{ym} doctor_prefs", old,
+                        month.get("doctor_prefs"), "manual")
         self.update_month(ym, _mut)
 
     def get_person_locks(self, ym: str) -> list:

@@ -17,6 +17,10 @@ def balance_clinics(inp, slots, *, control=None):
     and only for a strict doctor improvement. This preserves individual daily,
     weekly and course counts, all special duties, and family requirements.
     The lexicographically decreasing integer potential ensures termination.
+
+    [2026-11-26 使用者] 指定多跟醫師排在最前面:各類別(Clerk ＞ 家醫科 ＞ 外訓 ＞ PGY)
+    的「離目標還差幾次」平方和依序比較(差得多的人先補)。被指定的人可以因此少跟一位
+    其他醫師,但原本有跟其他醫師的話至少留一次;被換走的人仍不可少跟一位不同醫師。
     """
     order = arbitration_order(inp)
 
@@ -41,7 +45,13 @@ def balance_clinics(inp, slots, *, control=None):
             return ((d.weekday(), s) in TWO_PGY_PHOTO_ONLY) == ((d.weekday(), t) in TWO_PGY_PHOTO_ONLY)
         return True
 
+    from .doctor_prefs import SCOPES
+    prefs: dict = {}
+    for pref in getattr(inp, "doctor_prefs", ()) or ():
+        prefs.setdefault(pref.key, []).append((pref.doctor, pref.target))
+    preferred = {k: {doc for doc, _ in v} for k, v in prefs.items()}
     rooms_count, doctors_count = Counter(), Counter()
+    follow_total, seen = Counter(), {}
     sources = {iso: ss for iso, ss in inp.prior_sessions.items() if iso[:7] < inp.ym}
     sources.update({iso: ss for iso, ss in inp.course_fixed.items() if iso[:7] > inp.ym})
     sources.update({iso: ss for iso, ss in slots.items() if iso[:7] == inp.ym})
@@ -67,8 +77,20 @@ def balance_clinics(inp, slots, *, control=None):
                     if iso[:7] < inp.ym and p in inp.prior_pgy:
                         continue
                     rooms_count[k, r] += 1
+                    follow_total[k] += 1
                     if (name := doctor(d, s, r)):
                         doctors_count[k, name] += 1
+                        seen.setdefault(k, set()).add(name)
+
+    def short(k, name, goal, change=0):
+        """離目標還差幾次;沒填次數＝盡量多(以這個人的跟診總數為上限)。"""
+        return max(0, (goal or follow_total[k]) - doctors_count[k, name] - change)
+
+    def other_doctors(k, dc):
+        """被指定的人跟的【其他】醫師有幾位(換完之後)。"""
+        names = seen.get(k, set()) | {n for (kk, n) in dc if kk == k}
+        return sum(doctors_count[k, n] + dc.get((k, n), 0) > 0
+                   for n in names if n not in preferred.get(k, ()))
 
     def delta(counter, changes):
         return sum(2 * counter[k] * n + n * n for k, n in changes.items())
@@ -99,7 +121,7 @@ def balance_clinics(inp, slots, *, control=None):
                     if is_follow_slot(room) and room in inp.grid[dd].get(session, []):
                         for person in members:
                             sequences.setdefault(key(dd, person), []).append((dd, session, room))
-        best, best_score = None, (0, 0, 0, 0)
+        best, best_score = None, (0,) * (len(SCOPES) + 4)
         for d in sorted(inp.grid):
             if control is not None:
                 control.checkpoint("平均跟診醫師")
@@ -155,13 +177,26 @@ def balance_clinics(inp, slots, *, control=None):
                                     unique = Counter()
                                     for (k, name), n in dc.items():
                                         unique[k] += int(doctors_count[k, name] + n > 0) - int(doctors_count[k, name] > 0)
-                                    if any(n < 0 for n in unique.values()):
+                                    tiers, own = [0] * len(SCOPES), Counter()
+                                    for k in {kp, kq} - {None}:
+                                        for name, goal in prefs.get(k, ()):
+                                            n = dc.get((k, name), 0)
+                                            if n:
+                                                change = short(k, name, goal, n) ** 2 - short(k, name, goal) ** 2
+                                                tiers[SCOPES.index(k[0])] += change
+                                                own[k] += change
+                                    if any(n < 0 and not own[k] < 0 for k, n in unique.items()):
                                         continue  # No person's distinct-doctor coverage is sacrificed.
-                                    score = (-sum(unique.values()), delta(doctors_count, dc), delta(rooms_count, rc))
-                                    if cross and score[:2] >= (0, 0):
+                                    if any(k in prefs and dc and other_doctors(k, {}) > 0 and other_doctors(k, dc) == 0
+                                           for k in {kp, kq} - {None}):
+                                        continue  # 被指定的人原本有跟其他醫師 → 至少留一次。
+                                    score = (*tiers, -sum(unique.values()), delta(doctors_count, dc),
+                                             delta(rooms_count, rc))
+                                    width = len(SCOPES)
+                                    if cross and score[:width + 2] >= (0,) * (width + 2):
                                         continue
                                     temporal = 0
-                                    if score == (0, 0, 0) and not cross:
+                                    if score == (0,) * (width + 3) and not cross:
                                         for k, room in ((kp, target), (kq, r)):
                                             if k is not None:
                                                 seq = sequences.get(k, [])
@@ -192,3 +227,6 @@ def balance_clinics(inp, slots, *, control=None):
                     del cells[room]
         rooms_count.update(rc)
         doctors_count.update(dc)
+        for (k, name), n in dc.items():
+            if n > 0:
+                seen.setdefault(k, set()).add(name)

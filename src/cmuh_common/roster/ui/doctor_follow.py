@@ -59,7 +59,7 @@ class DoctorFollowStats(ttk.Frame):
             ("period", "統計期間", 215), ("follow", "已排跟診", 75),
             ("doctors", "醫師數", 65), ("first", "最多", 160),
             ("second", "次多", 160), ("others", "其他", 155),
-            ("unknown", "醫師未標示", 90), ("biopsy", "切片", 55),
+            ("unknown", "醫師未標示", 90), ("prefs", "指定多跟", 150), ("biopsy", "切片", 55),
             ("photo", "照光", 55), ("tx", "治療", 55), ("rest", "放假", 55),
         ), height=8)
         self._summary.bind("<<TreeviewSelect>>", self._select_person)
@@ -161,8 +161,8 @@ class DoctorFollowStats(ttk.Frame):
             self._summary.insert("", "end", iid=iid, values=(
                 row.scope, row.code, period, row.follow, len(row.doctors),
                 groups[0] if groups else "—", groups[1] if len(groups) > 1 else "—",
-                others, row.unknown, row.biopsy, row.photo, row.treatment, row.rest))
-        self._fit_text(self._summary, ("period", "first", "second", "others"))
+                others, row.unknown, row.pref_text(), row.biopsy, row.photo, row.treatment, row.rest))
+        self._fit_text(self._summary, ("period", "first", "second", "others", "prefs"))
         self._status.config(
             text=f"{self.app.ym}｜{len(self._visible)} 人｜已排跟診次數", foreground="")
         if not self._visible:
