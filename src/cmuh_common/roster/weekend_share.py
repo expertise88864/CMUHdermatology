@@ -105,17 +105,55 @@ def counted_blocks(blocks, exempt, holidays=()) -> list:
             and not any(d in exempt for d in weekend_chain(b.saturday, holidays))]
 
 
-def month_units(year: int, month: int, duty: dict, holidays, exempt) -> dict:
+def month_units(year: int, month: int, duty: dict, holidays, exempt,
+                until: date | None = None) -> dict:
     """某月每人的週末次數 {member_id: 次}。duty: {date: member_id}。
 
     以【週六那天的人】為準：連休段被使用者指定拆給不同人時，值週六的人才是
-    「值了這個週末」的人（與 WeekendCapRule、last_weekend 同一個判準）。"""
+    「值了這個週末」的人（與 WeekendCapRule、last_weekend 同一個判準）。
+    until 給定 → 只算週六在那天(含)以前的週末(「到目前為止」用)。"""
     out: dict = {}
     blocks = build_duty_blocks(year, month, set(holidays or ()))
     for b in counted_blocks(blocks, exempt, holidays):
+        if until is not None and b.saturday > until:
+            continue
         mid = duty.get(b.saturday)
         if mid:
             out[mid] = out.get(mid, 0) + 1
+    return out
+
+
+def vs_fair_share(months: list, current, holidays, exempt, until: date) -> dict:
+    """[2026-11-28 使用者] VS「在輪期間平均份」的到今天為止統計。
+
+    months：本週期由早到晚、到要看的那個月為止 [(ym, {date: member_id})]
+    (整個月的班表;在輪與否以整個月看,與 `vs_expected` 同一套)。
+    只算週六在 until(含)以前的週末:週六＋週日段算 1 次,春節等標「不計入」的
+    週末段不算,國定假日落在週六日照算。
+    → {member_id: {"start": 第一次值班的月份或 None, "so_far": 已值次數,
+                   "expected": 應值次數(每個週末由當時在輪的人平分), "diff": 差額}}
+    只列 current(目前名單)。"""
+    cut = f"{until.year:04d}-{until.month:02d}"
+    history = []
+    so_far: dict = {}
+    start: dict = {}
+    for ym, duty in months:
+        if ym > cut:
+            break
+        units = month_units(int(ym[:4]), int(ym[5:7]), duty, holidays, exempt, until)
+        people = sorted(set(duty.values()))
+        history.append((people, sum(units.values())))
+        for mid in people:
+            start.setdefault(mid, ym)
+        for mid, n in units.items():
+            so_far[mid] = so_far.get(mid, 0) + n
+    expected = vs_expected(history, list(current))
+    out = {}
+    for mid in current:
+        e = round(expected.get(mid, 0.0), 1)
+        n = so_far.get(mid, 0)
+        out[mid] = {"start": start.get(mid), "so_far": n, "expected": e,
+                    "diff": round(n - e, 1)}
     return out
 
 

@@ -7,7 +7,8 @@ Sheet「結算」：每位成員的平日/假日/總班/點數/帳本餘額。
 from __future__ import annotations
 
 from cmuh_common.roster.export_common import (
-    WD_CN, day_grid_rows, member_tally, title_text,
+    VS_WEEKEND_HEADS, VS_WEEKEND_NOTE, VS_WEEKEND_TITLE, WD_CN, day_grid_rows,
+    member_tally, title_text, vs_weekend_rows,
 )
 from cmuh_common.roster.model import is_weekend, week_matrix
 
@@ -33,6 +34,8 @@ def export(path: str, data: dict) -> None:
     wb = Workbook()
     _sheet_calendar(wb.active, data)
     _sheet_summary(wb.create_sheet("結算"), data)
+    if vs_weekend_rows(data):
+        _sheet_vs_weekend(wb.create_sheet("三線週末"), data)
     _sheet_day_schedule(wb.create_sheet("PGY-Clerk"), data)   # [RS-01]
     _sheet_day_explanation(wb.create_sheet("排班統計"), data)
     # 通用樣式：所有格自動換行、置中
@@ -123,6 +126,28 @@ def _sheet_summary(ws, data: dict) -> None:
             _set_excel_safe_text(ws.cell(row=row, column=2), name)
             row += 1
     for c, w in zip("ABCDEFG", (6, 10, 6, 6, 6, 6, 8), strict=True):
+        ws.column_dimensions[c].width = w
+
+
+def _sheet_vs_weekend(ws, data: dict) -> None:
+    """[2026-11-28 使用者] 三線週末:跟在輪期間的平均份比(新加入的人次數少,差額仍近 0)。"""
+    from openpyxl.styles import Font
+
+    ws.append([VS_WEEKEND_TITLE])
+    ws.cell(row=1, column=1).font = Font(bold=True)
+    ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=5)
+    ws.append(list(VS_WEEKEND_HEADS))
+    for c in range(1, 6):
+        ws.cell(row=2, column=c).font = Font(bold=True)
+    for i, (who, start, done, expected, diff) in enumerate(vs_weekend_rows(data), start=3):
+        ws.append([None, start, done, expected, None])
+        _set_excel_safe_text(ws.cell(row=i, column=1), who)
+        _set_excel_safe_text(ws.cell(row=i, column=5), diff)     # "+0.4" 不可被當公式
+    ws.append([])
+    ws.append([VS_WEEKEND_NOTE])
+    ws.merge_cells(start_row=ws.max_row, start_column=1, end_row=ws.max_row, end_column=5)
+    ws.row_dimensions[ws.max_row].height = 48
+    for c, w in zip("ABCDE", (12, 10, 10, 10, 8), strict=True):
         ws.column_dimensions[c].width = w
 
 

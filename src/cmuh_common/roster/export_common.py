@@ -90,3 +90,27 @@ def day_grid_rows(day_slots: dict, year: int, month: int) -> list:
         if any(c for _s, cs in sessions for c in cs):    # 該週有任一格有內容才輸出
             blocks.append({"weekdays": weekdays, "sessions": sessions})
     return blocks
+
+
+#: [2026-11-28 使用者] 匯出班表附的三線週末表(跟在輪期間平均份比)。
+VS_WEEKEND_TITLE = "三線週末值班（本週期至今；跟在輪期間的平均份比）"
+VS_WEEKEND_HEADS = ("主治醫師", "開始輪值", "至今已值", "至今應值", "差額")
+VS_WEEKEND_NOTE = ("週六＋週日算 1 次（國定假日落在週六日照算，春節不算）。"
+                   "應值＝從開始輪值那個月起，每個週末由當時在輪的人平分；"
+                   "差額＝已值−應值，大家都在 0 附近就是平均。")
+
+
+def vs_weekend_rows(data: dict) -> list:
+    """→ [(主治醫師, 開始輪值, 至今已值, 至今應值, 差額字串)]；沒有資料 → []。"""
+    fair = data.get("vs_weekend") or {}
+    vs = data.get("vs") or {}
+    out = []
+    for mid in vs.get("members") or []:
+        row = fair.get(mid)
+        if not row:
+            continue
+        start = row.get("start")
+        out.append((vs.get("names", {}).get(mid, mid),
+                    f"{int(start[:4])}/{int(start[5:7])}" if start else "—",
+                    row["so_far"], row["expected"], f"{row['diff']:+.1f}"))
+    return out

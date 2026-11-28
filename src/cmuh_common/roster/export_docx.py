@@ -7,7 +7,8 @@
 from __future__ import annotations
 
 from cmuh_common.roster.export_common import (
-    WD_CN, day_grid_rows, leaves_summary, title_text,
+    VS_WEEKEND_HEADS, VS_WEEKEND_NOTE, VS_WEEKEND_TITLE, WD_CN, day_grid_rows,
+    leaves_summary, title_text, vs_weekend_rows,
 )
 from cmuh_common.roster.model import week_matrix
 
@@ -49,6 +50,7 @@ def export(path: str, data: dict) -> None:
             table.cell(3, c).text = vs["names"].get(vp, vp) if vp else ""
         doc.add_paragraph("")            # 週表格之間留白
 
+    _add_vs_weekend(doc, data)           # [2026-11-28] 三線週末(在輪期間平均份)
     _add_day_schedule(doc, data)         # [RS-01] PGY/Clerk 日排班
     explanation = data.get("day_explanation") or ""
     if explanation:
@@ -56,6 +58,21 @@ def export(path: str, data: dict) -> None:
         for line in explanation.splitlines()[1:]:
             doc.add_paragraph(line)
     doc.save(path)
+
+
+def _add_vs_weekend(doc, data: dict) -> None:
+    rows = vs_weekend_rows(data)
+    if not rows:
+        return
+    doc.add_heading(VS_WEEKEND_TITLE, level=2)
+    table = doc.add_table(rows=1 + len(rows), cols=len(VS_WEEKEND_HEADS))
+    table.style = "Table Grid"
+    for c, head in enumerate(VS_WEEKEND_HEADS):
+        table.cell(0, c).text = head
+    for r, row in enumerate(rows, start=1):
+        for c, value in enumerate(row):
+            table.cell(r, c).text = str(value)
+    doc.add_paragraph(VS_WEEKEND_NOTE)
 
 
 def _add_day_schedule(doc, data: dict) -> None:

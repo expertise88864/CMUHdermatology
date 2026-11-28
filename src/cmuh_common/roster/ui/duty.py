@@ -320,21 +320,26 @@ class CalendarDutyTab(ttk.Frame):
         ttk.Label(parent, text="R 年度週末（本週期，春節不計）",
                   font=(OVR_FONT, 10, "bold")
                   ).pack(anchor="w", padx=6, pady=(8, 0))
-        self._wk = ttk.Treeview(parent, columns=("who", "done", "to", "yr"),
+        self._wk = ttk.Treeview(parent, columns=("who", "now", "done", "to", "yr"),
                                 show="headings", height=3)
-        for c, t, w in (("who", "住院醫師", 110), ("done", "已值", 40),
+        for c, t, w in (("who", "住院醫師", 110), ("now", "至今", 36),
+                        ("done", "含本月", 44),
                         ("to", "至本月目標", 66), ("yr", "全年目標", 58)):
             self._wk.heading(c, text=t)
             self._wk.column(c, width=w, anchor="w" if c == "who" else "center")
         self._wk.pack(fill="x", padx=6)
         # [2026-11-24 使用者] 三線也統計;加入之前的月份不算
-        ttk.Label(parent, text="VS 年度週末（本週期；加入後才計）",
+        ttk.Label(parent, text="VS 週末（本週期；跟在輪期間平均份比）",
                   font=(OVR_FONT, 10, "bold")
                   ).pack(anchor="w", padx=6, pady=(8, 0))
-        self._wk_vs = ttk.Treeview(parent, columns=("who", "done", "to", "yr"),
-                                   show="headings", height=7)
-        for c, t, w in (("who", "主治醫師", 110), ("done", "已值", 40),
-                        ("to", "至本月目標", 66), ("yr", "全年目標", 58)):
+        # [2026-11-28 使用者] 跟「在輪期間的平均份」比:12 月才加入的人次數少,
+        #   差額仍在 0 附近 → 看得出不是被少排。
+        self._wk_vs = ttk.Treeview(
+            parent, columns=("who", "start", "now", "exp", "diff", "done", "yr"),
+            show="headings", height=7)
+        for c, t, w in (("who", "主治醫師", 62), ("start", "開始", 36),
+                        ("now", "至今", 34), ("exp", "應值", 36), ("diff", "差額", 38),
+                        ("done", "含本月", 44), ("yr", "全年", 38)):
             self._wk_vs.heading(c, text=t)
             self._wk_vs.column(c, width=w, anchor="w" if c == "who" else "center")
         self._wk_vs.pack(fill="x", padx=6)
@@ -363,7 +368,10 @@ class CalendarDutyTab(ttk.Frame):
             self._bx.insert("", "end", values=(who, int(counts.get(m.id, 0))))
 
     def _reload_weekend_year(self, ctx, month: dict) -> None:
-        """年度週末：已值／至本月目標／全年目標（service.weekend_year_summary）。"""
+        """年度週末：至今已值／含本月班表／至本月目標／全年目標（service.weekend_year_summary）。
+
+        [2026-11-28 使用者] 「至今」= 到今天為止實際值過的週末(只算週六日、春節不計);
+        「含本月」= 再加上本月班表裡還沒到的週末。"""
         tree = getattr(self, "_wk" if ctx.scope == "r" else "_wk_vs", None)
         if not tree:
             return
@@ -378,7 +386,15 @@ class CalendarDutyTab(ttk.Frame):
         for r in rows:
             level = f"（{r['level']}）" if ctx.scope == "r" else ""
             who = f"{r['id']} {r['name']}{level}" if r["name"] else f"{r['id']}{level}"
-            tree.insert("", "end", values=(who, r["done"], r["to_date"], r["year"]))
+            if ctx.scope == "r":
+                values = (who, r.get("so_far", ""), r["done"], r["to_date"], r["year"])
+            else:
+                start = r.get("start")
+                values = (who, f"{int(start[5:7])} 月" if start else "—",
+                          r.get("so_far", ""), r.get("expected", ""),
+                          f"{r['diff']:+.1f}" if "diff" in r else "",
+                          r["done"], r["year"])
+            tree.insert("", "end", values=values)
 
     # ── 資料 → 畫面 ──────────────────────────────────────────────────────
     def _member_map(self, scope: str) -> dict:

@@ -19,6 +19,7 @@
 """
 from __future__ import annotations
 
+import calendar
 import contextlib
 import copy
 import hashlib
@@ -67,6 +68,7 @@ from cmuh_common.roster.weekend_share import (
     duty_map as _weekend_duty_map, level_weights as _weekend_level_weights,
     vs_expected as _weekend_vs_expected,
     member_weights as _weekend_member_weights, month_units as _weekend_month_units,
+    vs_fair_share as _weekend_vs_fair_share,
 )
 from cmuh_common.roster.saturday_biopsy import HISTORY_KEEP_MONTHS as BIOPSY_HISTORY_KEEP_MONTHS
 from cmuh_common.roster.saturday_biopsy import (
@@ -592,12 +594,46 @@ class RosterService:
                                                  strict=True).items()
                 if round(float(v or 0.0), 4) != 0.0}
 
-    @staticmethod
-    def weekend_year_summary(ctx: SolveContext, duty_this_month: dict,
-                             finalized: bool = False) -> list:
-        """年度週末統計（見 weekend_share.year_summary；畫面與報告同一份）。"""
+    def weekend_year_summary(self, ctx: SolveContext, duty_this_month: dict,
+                             finalized: bool = False, today: "date | None" = None) -> list:
+        """年度週末統計（見 weekend_share.year_summary；畫面與報告同一份）。
+
+        [2026-11-28 使用者] 每列另加 so_far:本週期到今天(看的月份還沒到今天 →
+        到該月底)為止實際值過的週末次數。只算週六＋週日(週六在那天以前的週末),
+        春節等標「不計入」的週末段不算;國定假日落在週六日照算。
+        VS 再加 start/expected/diff:開始輪值的月份、到同一天為止「在輪期間平均份」
+        的應值次數與差額(見 weekend_share.vs_fair_share)。"""
         from cmuh_common.roster.weekend_share import year_summary  # noqa: PLC0415
-        return year_summary(ctx, duty_this_month, finalized=finalized)
+        rows = year_summary(ctx, duty_this_month, finalized=finalized)
+        if not rows:
+            return rows
+        ym = f"{ctx.year:04d}-{ctx.month:02d}"
+        months = [(pym, _weekend_duty_map(self.storage.load_month(pym), ctx.scope))
+                  for pym in cycle_months(ym)[:-1]]
+        months.append((ym, dict(duty_this_month)))
+        fair = self._weekend_so_far(ctx, months, today)
+        for row in rows:
+            row.update(fair.get(row["id"]) or {"so_far": 0})
+        return rows
+
+    @staticmethod
+    def _weekend_so_far(ctx: SolveContext, months: list, today: "date | None") -> dict:
+        """畫面與匯出共用:到 min(今天, 該月底) 為止的週末統計 {member_id: {...}}。"""
+        from cmuh_common.roster.weekend_share import (  # noqa: PLC0415
+            month_units, vs_fair_share)
+        until = min(today or date.today(), ctx.days[-1])
+        ids = [m.id for m in ctx.members]
+        if ctx.scope == "vs":
+            return vs_fair_share(months, ids, ctx.holidays, ctx.weekend_exempt, until)
+        out: dict = {}
+        cut = f"{until.year:04d}-{until.month:02d}"
+        for pym, duty in months:
+            if pym > cut:
+                break
+            for mid, n in month_units(int(pym[:4]), int(pym[5:7]), duty, ctx.holidays,
+                                      ctx.weekend_exempt, until).items():
+                out.setdefault(mid, {"so_far": 0})["so_far"] += n
+        return out
 
     @staticmethod
     def _weekend_prior(st, ym: str, members, holidays, exempt,
@@ -850,6 +886,14 @@ class RosterService:
             if (dt.year, dt.month) == (y, m):
                 sat_biopsy[dt] = str(p)
 
+        # [2026-11-28 使用者] 三線週末「在輪期間平均份」:匯出的班表也附上,給 VS 看。
+        vs_ids = [d.get("id") for d in (cfg.get("vs_members") or []) if d.get("id")]
+        last_day = date(y, m, calendar.monthrange(y, m)[1])
+        vs_weekend = _weekend_vs_fair_share(
+            [(pym, _weekend_duty_map(src.load_month(pym), "vs")) for pym in cycle_months(ym)],
+            vs_ids, holidays, set(holiday_table.get("weekend_exempt") or ()),
+            min(date.today(), last_day))
+
         from .day_explanation import format_day_explanation
         current_stats = self.day_course_stats(
             ym, day_slots_override=month.get("day_slots") or {},
@@ -863,6 +907,7 @@ class RosterService:
             "day_slots": month.get("day_slots") or {},
             "day_grid": day_grid,
             "day_explanation": format_day_explanation(current_stats["explanation"]),
+            "vs_weekend": vs_weekend,
         }
 
     # ── PGY/Clerk 日排班（Phase 3）──────────────────────────────────────
