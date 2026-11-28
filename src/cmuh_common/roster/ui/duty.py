@@ -324,7 +324,7 @@ class CalendarDutyTab(ttk.Frame):
                                 show="headings", height=3)
         for c, t, w in (("who", "住院醫師", 110), ("now", "至今", 36),
                         ("done", "含本月", 44),
-                        ("to", "至本月目標", 66), ("yr", "全年目標", 58)):
+                        ("to", "至本月", 50), ("yr", "全年", 44)):
             self._wk.heading(c, text=t)
             self._wk.column(c, width=w, anchor="w" if c == "who" else "center")
         self._wk.pack(fill="x", padx=6)
@@ -335,11 +335,12 @@ class CalendarDutyTab(ttk.Frame):
         # [2026-11-28 使用者] 跟「在輪期間的平均份」比:12 月才加入的人次數少,
         #   差額仍在 0 附近 → 看得出不是被少排。
         self._wk_vs = ttk.Treeview(
-            parent, columns=("who", "start", "now", "exp", "diff", "done", "yr"),
+            parent, columns=("who", "start", "now", "done", "exp", "diff", "yr"),
             show="headings", height=7)
+        # 應值/差額與「含本月」同一段(算到本月底);「至今」只到今天
         for c, t, w in (("who", "主治醫師", 62), ("start", "開始", 36),
-                        ("now", "至今", 34), ("exp", "應值", 36), ("diff", "差額", 38),
-                        ("done", "含本月", 44), ("yr", "全年", 38)):
+                        ("now", "至今", 34), ("done", "含本月", 44),
+                        ("exp", "應值", 36), ("diff", "差額", 38), ("yr", "全年", 38)):
             self._wk_vs.heading(c, text=t)
             self._wk_vs.column(c, width=w, anchor="w" if c == "who" else "center")
         self._wk_vs.pack(fill="x", padx=6)
@@ -371,7 +372,7 @@ class CalendarDutyTab(ttk.Frame):
         """年度週末：至今已值／含本月班表／至本月目標／全年目標（service.weekend_year_summary）。
 
         [2026-11-28 使用者] 「至今」= 到今天為止實際值過的週末(只算週六日、春節不計);
-        「含本月」= 再加上本月班表裡還沒到的週末。"""
+        「含本月」= 再加上本月班表裡還沒到的週末;VS 的「應值/差額」與含本月同一段。"""
         tree = getattr(self, "_wk" if ctx.scope == "r" else "_wk_vs", None)
         if not tree:
             return
@@ -391,9 +392,8 @@ class CalendarDutyTab(ttk.Frame):
             else:
                 start = r.get("start")
                 values = (who, f"{int(start[5:7])} 月" if start else "—",
-                          r.get("so_far", ""), r.get("expected", ""),
-                          f"{r['diff']:+.1f}" if "diff" in r else "",
-                          r["done"], r["year"])
+                          r.get("so_far", ""), r["done"], r.get("expected", ""),
+                          f"{r['diff']:+.1f}" if "diff" in r else "", r["year"])
             tree.insert("", "end", values=values)
 
     # ── 資料 → 畫面 ──────────────────────────────────────────────────────

@@ -601,8 +601,9 @@ class RosterService:
         [2026-11-28 使用者] 每列另加 so_far:本週期到今天(看的月份還沒到今天 →
         到該月底)為止實際值過的週末次數。只算週六＋週日(週六在那天以前的週末),
         春節等標「不計入」的週末段不算;國定假日落在週六日照算。
-        VS 再加 start/expected/diff:開始輪值的月份、到同一天為止「在輪期間平均份」
-        的應值次數與差額(見 weekend_share.vs_fair_share)。"""
+        VS 再加 start/expected/diff:開始輪值的月份、到【本月底】(含本月班表,與
+        「含本月」同一段)為止「在輪期間平均份」的應值次數與差額
+        (見 weekend_share.vs_fair_share)。"""
         from cmuh_common.roster.weekend_share import year_summary  # noqa: PLC0415
         rows = year_summary(ctx, duty_this_month, finalized=finalized)
         if not rows:
@@ -611,9 +612,15 @@ class RosterService:
         months = [(pym, _weekend_duty_map(self.storage.load_month(pym), ctx.scope))
                   for pym in cycle_months(ym)[:-1]]
         months.append((ym, dict(duty_this_month)))
-        fair = self._weekend_so_far(ctx, months, today)
+        now = self._weekend_so_far(ctx, months, today)
+        # [2026-11-28 使用者] 開始/應值/差額跟「含本月」一起算到本月底(含本月班表裡
+        #   還沒到的週末)—— 12 月才加入的人看 12 月班表就要看得到自己的份。
+        month_end = self._weekend_so_far(ctx, months, ctx.days[-1])
         for row in rows:
-            row.update(fair.get(row["id"]) or {"so_far": 0})
+            fair = dict(month_end.get(row["id"]) or {})
+            fair.pop("so_far", None)
+            row.update(fair)
+            row["so_far"] = (now.get(row["id"]) or {}).get("so_far", 0)
         return rows
 
     @staticmethod
@@ -888,13 +895,13 @@ class RosterService:
             if (dt.year, dt.month) == (y, m):
                 sat_biopsy[dt] = str(p)
 
-        # [2026-11-28 使用者] 三線週末「在輪期間平均份」:匯出的班表也附上,給 VS 看。
+        # [2026-11-28 使用者] 三線週末「在輪期間平均份」(含本月班表):匯出的班表也附上,給 VS 看。
         vs_ids = [d.get("id") for d in (cfg.get("vs_members") or []) if d.get("id")]
         last_day = date(y, m, calendar.monthrange(y, m)[1])
         vs_weekend = _weekend_vs_fair_share(
             [(pym, _weekend_duty_map(src.load_month(pym), "vs")) for pym in cycle_months(ym)],
             vs_ids, holidays, set(holiday_table.get("weekend_exempt") or ()),
-            min(date.today(), last_day))
+            last_day)                     # 與畫面「含本月」同一段:算到本月底
 
         from .day_explanation import format_day_explanation
         current_stats = self.day_course_stats(

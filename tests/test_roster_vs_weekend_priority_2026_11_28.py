@@ -195,10 +195,32 @@ def test_screen_rows_carry_the_fair_share(tmp_path):
         st.save_month(f"2026-{mm:02d}", doc)
     svc = RosterService(st)
     ctx = svc.build_context("vs", "2026-12")
-    rows = {r["id"]: r for r in svc.weekend_year_summary(
-        ctx, _month_duty(2026, 12, ["T", "F", "D", "J"]), today=date(2026, 12, 13))}
+    dec = _month_duty(2026, 12, ["T", "F", "D", "J"])     # 12/5 T、12/12 F、12/19 D、12/26 J
+    rows = {r["id"]: r for r in svc.weekend_year_summary(ctx, dec, today=date(2026, 12, 13))}
     assert rows["T"]["start"] == "2026-12" and rows["T"]["so_far"] == 1
-    assert rows["D"]["expected"] == pytest.approx(round(18 / 5 + 2 / 7, 1))
+    # 應值/差額跟「含本月」同一段:算到 12 月底(4 個週末 7 人分)
+    assert rows["D"]["expected"] == pytest.approx(round(18 / 5 + 4 / 7, 1))
+    assert rows["D"]["diff"] == pytest.approx(rows["D"]["done"] - rows["D"]["expected"])
+
+
+def test_december_joiners_show_up_before_december_starts(tmp_path):
+    """[2026-11-28 使用者截圖] 11/28 打開 12 月:U、F 的開始/應值/差額要算進 12 月班表。"""
+    st = RosterStorage(str(tmp_path))
+    cfg = st.load_config()
+    cfg["vs_members"] = [{"id": p, "name": p} for p in NOW]
+    st.save_config(cfg)
+    for mm in (8, 9, 10, 11):
+        doc = st.load_month(f"2026-{mm:02d}")
+        doc["vs_duty"] = {d.isoformat(): {"person": p, "auto": True}
+                          for d, p in _month_duty(2026, mm, OLD).items()}
+        st.save_month(f"2026-{mm:02d}", doc)
+    svc = RosterService(st)
+    ctx = svc.build_context("vs", "2026-12")
+    dec = _month_duty(2026, 12, ["T", "F", "D", "J"])
+    rows = {r["id"]: r for r in svc.weekend_year_summary(ctx, dec, today=date(2026, 11, 28))}
+    assert rows["T"]["start"] == "2026-12" and rows["T"]["so_far"] == 0
+    assert rows["T"]["done"] == 1 and rows["T"]["expected"] == round(4 / 7, 1)
+    assert rows["T"]["diff"] == pytest.approx(1 - round(4 / 7, 1))
 
 
 def _export_data(tmp_path):
@@ -221,7 +243,7 @@ def test_xlsx_has_the_vs_weekend_sheet(tmp_path):
     export_xlsx.export(str(out), _export_data(tmp_path))
     ws = load_workbook(str(out))["三線週末"]
     rows = [[c.value for c in row] for row in ws.iter_rows()]
-    assert rows[1] == ["主治醫師", "開始輪值", "至今已值", "至今應值", "差額"]
+    assert rows[1] == ["主治醫師", "開始輪值", "已值（含本月）", "應值", "差額"]
     assert rows[2] == ["D", "2026/8", 1, 1.0, "+0.0"]
     assert ws.cell(row=3, column=5).data_type == "s"
 
@@ -249,10 +271,10 @@ def test_duty_tab_shows_the_fair_share_columns(tk_root, tmp_path):
     tk_root.update()
     vs = tab._wk_vs
     assert [vs.heading(c)["text"] for c in vs["columns"]] == [
-        "主治醫師", "開始", "至今", "應值", "差額", "含本月", "全年"]
+        "主治醫師", "開始", "至今", "含本月", "應值", "差額", "全年"]
     row = vs.item(vs.get_children()[0])["values"]
-    assert str(row[0]).startswith("D") and row[1] == "8 月" and str(row[4]) == "+0.0"
+    assert str(row[0]).startswith("D") and row[1] == "8 月" and str(row[5]) == "+0.0"
     r = tab._wk
     assert [r.heading(c)["text"] for c in r["columns"]] == [
-        "住院醫師", "至今", "含本月", "至本月目標", "全年目標"]
+        "住院醫師", "至今", "含本月", "至本月", "全年"]
     tab.destroy()
