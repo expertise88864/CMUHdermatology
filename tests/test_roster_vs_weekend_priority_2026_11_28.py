@@ -163,6 +163,26 @@ def test_joiners_are_compared_with_their_own_share():
     assert before["T"] == {"start": None, "so_far": 0, "expected": 0.0, "diff": 0.0}
 
 
+def test_stray_adjacent_month_cells_do_not_join_the_rotation(tmp_path):
+    """[外審 PR #37 第 1 輪] 11 月檔殘留一格 12 月的 T:T 不算 11 月在輪。"""
+    from cmuh_common.roster.weekend_share import vs_fair_share
+    nov = _month_duty(2026, 11, ["D", "J"]) | {date(2026, 12, 5): "T"}
+    fair = vs_fair_share([("2026-11", nov)], ["D", "J", "T"], set(), set(),
+                         date(2026, 11, 30))
+    assert fair["D"]["expected"] == 2.0 and fair["T"]["start"] is None
+    st = RosterStorage(str(tmp_path))
+    cfg = st.load_config()
+    cfg["vs_members"] = [{"id": p, "name": p} for p in ("D", "J", "T")]
+    st.save_config(cfg)
+    for ym in ("2026-08", "2026-09", "2026-10"):
+        st.save_month(ym, st.load_month(ym))
+    doc = st.load_month("2026-11")
+    doc["vs_duty"] = {d.isoformat(): {"person": p, "auto": True} for d, p in nov.items()}
+    st.save_month("2026-11", doc)
+    ctx = RosterService(st).build_context("vs", "2026-12")
+    assert ctx.weekend_expected["T"] == 0 and ctx.weekend_expected["D"] == 2.0
+
+
 def test_screen_rows_carry_the_fair_share(tmp_path):
     st = RosterStorage(str(tmp_path))
     cfg = st.load_config()

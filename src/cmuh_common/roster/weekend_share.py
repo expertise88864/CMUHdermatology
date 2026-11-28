@@ -140,7 +140,10 @@ def vs_fair_share(months: list, current, holidays, exempt, until: date) -> dict:
     for ym, duty in months:
         if ym > cut:
             break
-        units = month_units(int(ym[:4]), int(ym[5:7]), duty, holidays, exempt, until)
+        y, m = int(ym[:4]), int(ym[5:7])
+        # 月檔可能殘留相鄰月份的格子(手動編輯、跨機合併)→ 在輪只看當月日期
+        duty = {d: p for d, p in duty.items() if (d.year, d.month) == (y, m)}
+        units = month_units(y, m, duty, holidays, exempt, until)
         people = sorted(set(duty.values()))
         history.append((people, sum(units.values())))
         for mid in people:

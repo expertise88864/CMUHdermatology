@@ -648,9 +648,11 @@ class RosterService:
         out: dict = {}
         history: list = []
         for pym in cycle_months(ym)[:-1]:
-            duty = _weekend_duty_map(st.load_month(pym), scope)
-            units = _weekend_month_units(int(pym[:4]), int(pym[5:7]), duty,
-                                         holidays, exempt)
+            y, m = int(pym[:4]), int(pym[5:7])
+            # 相鄰月份殘留的格子不算這個月在輪(外審 PR #37 第 1 輪)
+            duty = {d: p for d, p in _weekend_duty_map(st.load_month(pym), scope).items()
+                    if (d.year, d.month) == (y, m)}
+            units = _weekend_month_units(y, m, duty, holidays, exempt)
             history.append((sorted(set(duty.values())), sum(units.values())))
             for mid, n in units.items():
                 if mid in ids:
